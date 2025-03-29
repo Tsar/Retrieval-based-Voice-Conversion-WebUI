@@ -31,6 +31,7 @@ import traceback
 import threading
 import shutil
 import logging
+import tempfile
 
 
 logging.getLogger("numba").setLevel(logging.WARNING)
@@ -38,7 +39,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-tmp = os.path.join(now_dir, "TEMP")
+tmp = os.path.join(tempfile.gettempdir(), "RVC")
 shutil.rmtree(tmp, ignore_errors=True)
 shutil.rmtree("%s/runtime/Lib/site-packages/infer_pack" % (now_dir), ignore_errors=True)
 shutil.rmtree("%s/runtime/Lib/site-packages/uvr5_pack" % (now_dir), ignore_errors=True)
