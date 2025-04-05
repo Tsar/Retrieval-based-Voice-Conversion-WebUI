@@ -14,19 +14,14 @@ import numpy as np
 from stream_rvc_processor import StreamRVCProcessor
 
 logger = logging.getLogger('infer-websocket-stream')
-logger.setLevel(logging.DEBUG)
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
 
 BEARER_PREFIX = 'Bearer '
 
 AUTH_TOKEN = os.environ['AUTH_TOKEN']
 
-SSL_CERT = os.environ['SSL_CERT_FILENAME']
-SSL_KEY  = os.environ['SSL_KEY_FILENAME']
+SSL_CERT = os.environ.get('SSL_CERT_FILENAME')
+SSL_KEY  = os.environ.get('SSL_KEY_FILENAME')
+ALLOW_UNENCRYPTED_SERVING = int(os.environ.get('ALLOW_UNENCRYPTED_SERVING', 0))
 
 INPUT_VOICES_PITCH = {
     'coral': 4,
@@ -151,6 +146,18 @@ async def handler(websocket):
         stop_event.set()
 
 async def main():
+    ssl_context = None
+    if SSL_CERT and SSL_KEY and os.path.isfile(SSL_CERT) and os.path.isfile(SSL_KEY):
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.load_cert_chain(SSL_CERT, keyfile=SSL_KEY)
+        logger.info('SSL certificates found, using encryption')
+    else:
+        if ALLOW_UNENCRYPTED_SERVING == 1:
+            logger.warning('SSL certificates NOT FOUND, launching without encryption')
+        else:
+            logger.warning('SSL certificates NOT FOUND, unencrypted serving prohibited')
+            return
+
     global rvc_processor
     rvc_processor = StreamRVCProcessor(
         pth_path='assets/weights/voicevox_speaker_43.pth',
@@ -160,14 +167,6 @@ async def main():
     )
     rvc_processor.start_vc()
     rvc_processor.process_audio_block(np.zeros(rvc_processor.block_frame, dtype=np.float32))  # warmup
-
-    ssl_context = None
-    if os.path.isfile(SSL_CERT) and os.path.isfile(SSL_KEY):
-        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ssl_context.load_cert_chain(SSL_CERT, keyfile=SSL_KEY)
-        logger.info('SSL certificates found, using encryption')
-    else:
-        logger.warning('SSL certificates NOT FOUND, launching without encryption')
 
     try:
         async with websockets.serve(handler, host='', port=7411, ssl=ssl_context) as server:
