@@ -6,8 +6,12 @@ import ssl
 import uuid
 import logging
 from urllib.parse import urlparse, parse_qs
+from typing import Optional
 import asyncio
 import websockets
+import numpy as np
+
+import realtime_rvc_processor
 
 logger = logging.getLogger('infer-websocket-stream')
 logger.setLevel(logging.DEBUG)
@@ -23,6 +27,8 @@ AUTH_TOKEN = os.environ['AUTH_TOKEN']
 
 SSL_CERT = os.environ['SSL_CERT_FILENAME']
 SSL_KEY  = os.environ['SSL_KEY_FILENAME']
+
+rvc_processor: Optional[realtime_rvc_processor.RVCProcessor] = None
 
 def error_message(message, log_prefix='', details_to_log=None):
     if details_to_log:
@@ -70,6 +76,7 @@ async def handler(websocket):
         return
 
     logger.info(f'{log_prefix}Starting voice conversion to {target_voice} transposed by {transpose_by}')
+    rvc_processor.rvc.change_key(transpose_by)
     try:
         while True:
             data = await websocket.recv()
@@ -77,7 +84,10 @@ async def handler(websocket):
                 print(data)
                 pass
             elif isinstance(data, bytes):
-                pass  # TODO
+                #np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                #processed = rvc_processor.process_audio_block(data)
+                #await websocket.send(processed)
+                print('Received bytes')
             else:
                 await websocket.send(error_message('Received unrecognized data type', details_to_log=data))
                 continue
@@ -87,6 +97,15 @@ async def handler(websocket):
         logger.error(f'{log_prefix}Disconnected with error: {ex}')
 
 async def main():
+    global rvc_processor
+    rvc_processor = realtime_rvc_processor.RVCProcessor(
+        pth_path='assets/weights/voicevox_speaker_43.pth',
+        index_path='logs/voicevox_speaker_43/added_IVF567_Flat_nprobe_1_voicevox_speaker_43_v2.index',
+        samplerate=24000,
+        pitch=12,
+    )
+    rvc_processor.start_vc()
+
     ssl_context = None
     if os.path.isfile(SSL_CERT) and os.path.isfile(SSL_KEY):
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
