@@ -131,6 +131,7 @@ async def main():
         pitch=12,
     )
     rvc_processor.start_vc()
+    rvc_processor.process_audio_block(np.zeros(rvc_processor.block_frame, dtype=np.float32))  # warmup
 
     ssl_context = None
     if os.path.isfile(SSL_CERT) and os.path.isfile(SSL_KEY):
