@@ -28,6 +28,16 @@ AUTH_TOKEN = os.environ['AUTH_TOKEN']
 SSL_CERT = os.environ['SSL_CERT_FILENAME']
 SSL_KEY  = os.environ['SSL_KEY_FILENAME']
 
+INPUT_VOICES_PITCH = {
+    'coral': 4,
+    'shimmer': 0,
+    'sage': 5,
+}
+
+TARGET_VOICES_PITCH = {
+    'voicevox_speaker_43': 8,
+}
+
 rvc_processor: Optional[StreamRVCProcessor] = None
 
 def error_message(message, log_prefix='', details_to_log=None):
@@ -63,16 +73,34 @@ async def handler(websocket):
     if 'target_voice' not in params:
         await websocket.send(error_message('No target_voice in query params', log_prefix=log_prefix, details_to_log=params))
         return
-    if 'transpose_by' not in params:
-        await websocket.send(error_message('No transpose_by in query params', log_prefix=log_prefix, details_to_log=params))
+    target_voice = params['target_voice'][0]
+    if target_voice not in TARGET_VOICES_PITCH:
+        await websocket.send(error_message(
+            f'Unsupported target_voice, only the following are supported: {TARGET_VOICES_PITCH.keys()}',
+            log_prefix=log_prefix,
+            details_to_log=params,
+        ))
         return
 
-    target_voice = params['target_voice'][0]
-    transpose_by_str = params['transpose_by'][0]
-    try:
-        transpose_by = int(transpose_by_str)
-    except ValueError:
-        await websocket.send(error_message('Bad transpose_by value', log_prefix=log_prefix, details_to_log=transpose_by_str))
+    if 'transpose_by' in params:
+        transpose_by_str = params['transpose_by'][0]
+        try:
+            transpose_by = int(transpose_by_str)
+        except ValueError:
+            await websocket.send(error_message('Bad transpose_by value', log_prefix=log_prefix, details_to_log=transpose_by_str))
+            return
+    elif 'input_voice' in params:
+        input_voice = params['input_voice'][0]
+        if input_voice not in INPUT_VOICES_PITCH:
+            await websocket.send(error_message(
+                f'Unsupported input_voice, only the following are supported: {INPUT_VOICES_PITCH.keys()}',
+                log_prefix=log_prefix,
+                details_to_log=params,
+            ))
+            return
+        transpose_by = TARGET_VOICES_PITCH[target_voice] - INPUT_VOICES_PITCH[input_voice]
+    else:
+        await websocket.send(error_message('No transpose_by or input_voice in query params', log_prefix=log_prefix, details_to_log=params))
         return
 
     logger.info(f'{log_prefix}Starting voice conversion to {target_voice} transposed by {transpose_by}')
