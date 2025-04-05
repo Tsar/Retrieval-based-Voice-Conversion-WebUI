@@ -65,7 +65,7 @@ async def main():
                     buffer += data
                 except asyncio.TimeoutError:
                     continue  # periodically checking if we need to stop
-            saveToWav(filename='OUTPUT.wav', audioData=buffer)
+            saveToWav(filename=f'{TEST_DATA_DIR}/OUTPUT.wav', audioData=buffer)
             print('Receiver stopped gracefully')
 
         asyncio.create_task(receiver())

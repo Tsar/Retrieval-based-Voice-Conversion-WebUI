@@ -29,3 +29,4 @@ ffprobe.*
 
 .idea
 /export_secrets.sh
+/websocket-test-client-data/
