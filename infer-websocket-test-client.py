@@ -74,6 +74,7 @@ async def main():
             await websocket.send(audio_part)
             audio_part_duration = len(audio_part) / 24000 / 2
             await asyncio.sleep(audio_part_duration / 3)  # simulate stream which is 3 times faster than realtime
+        await websocket.send('end_message')
         await asyncio.sleep(5)
         stopEvent.set()
         await asyncio.sleep(2)

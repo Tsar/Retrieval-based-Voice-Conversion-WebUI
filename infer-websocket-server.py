@@ -88,6 +88,7 @@ async def handler(websocket):
             while not stop_event.is_set():
                 try:
                     block_i16 = await asyncio.wait_for(process_blocks_queue.get(), timeout=1)
+                    assert len(block_i16) == block_size
                     block_f32 = np.frombuffer(block_i16, dtype=np.int16).astype(np.float32) / 32768.0
                     processed_f32 = rvc_processor.process_audio_block(block_f32)
                     processed_i16 = (np.clip(processed_f32, -1.0, 1.0 - 1.0 / 32768.0) * 32768.0).astype(np.int16).tobytes()
@@ -100,8 +101,12 @@ async def handler(websocket):
         while True:
             data = await websocket.recv()
             if isinstance(data, str):
-                print(data)
-                pass
+                if data == 'end_message':
+                    assert len(buffer) < block_size
+                    await process_blocks_queue.put(buffer.ljust(block_size, b'\x00'))
+                    buffer = b''
+                else:
+                    logger.error(f'{log_prefix}Unrecognized text received: "{data}"')
             elif isinstance(data, bytes):
                 buffer += data
                 while len(buffer) >= block_size:
