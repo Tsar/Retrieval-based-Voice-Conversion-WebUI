@@ -54,9 +54,29 @@ async def main():
     chosen_audio_key = random.choice(list(audio_files_parts.keys()))
 
     async with websockets.connect(URL, additional_headers={'Authorization': BEARER_PREFIX + AUTH_TOKEN}) as websocket:
+        stopEvent = asyncio.Event()
+
+        async def receiver():
+            buffer = b''
+            while not stopEvent.is_set():
+                try:
+                    data = await asyncio.wait_for(websocket.recv(), timeout=1)
+                    print(f'Received data of size {len(data)}')
+                    buffer += data
+                except asyncio.TimeoutError:
+                    continue  # periodically checking if we need to stop
+            saveToWav(filename='OUTPUT.wav', audioData=buffer)
+            print('Receiver stopped gracefully')
+
+        asyncio.create_task(receiver())
         for i, audio_part in enumerate(audio_files_parts[chosen_audio_key], start=1):
             print(f'Sending "{chosen_audio_key}", part {i}')
             await websocket.send(audio_part)
+            audio_part_duration = len(audio_part) / 24000 / 2
+            await asyncio.sleep(audio_part_duration / 3)  # simulate stream which is 3 times faster than realtime
+        await asyncio.sleep(5)
+        stopEvent.set()
+        await asyncio.sleep(2)
 
 if __name__ == '__main__':
     asyncio.run(main())

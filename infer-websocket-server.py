@@ -11,7 +11,7 @@ import asyncio
 import websockets
 import numpy as np
 
-import realtime_rvc_processor
+from stream_rvc_processor import StreamRVCProcessor
 
 logger = logging.getLogger('infer-websocket-stream')
 logger.setLevel(logging.DEBUG)
@@ -28,7 +28,7 @@ AUTH_TOKEN = os.environ['AUTH_TOKEN']
 SSL_CERT = os.environ['SSL_CERT_FILENAME']
 SSL_KEY  = os.environ['SSL_KEY_FILENAME']
 
-rvc_processor: Optional[realtime_rvc_processor.RVCProcessor] = None
+rvc_processor: Optional[StreamRVCProcessor] = None
 
 def error_message(message, log_prefix='', details_to_log=None):
     if details_to_log:
@@ -77,17 +77,36 @@ async def handler(websocket):
 
     logger.info(f'{log_prefix}Starting voice conversion to {target_voice} transposed by {transpose_by}')
     rvc_processor.rvc.change_key(transpose_by)
+    block_size = rvc_processor.block_frame * 2  # because PCM16
+    buffer = b''
+
+    process_blocks_queue = asyncio.Queue()
+    stop_event = asyncio.Event()
+
     try:
+        async def process_blocks():
+            while not stop_event.is_set():
+                try:
+                    block_i16 = await asyncio.wait_for(process_blocks_queue.get(), timeout=1)
+                    block_f32 = np.frombuffer(block_i16, dtype=np.int16).astype(np.float32) / 32768.0
+                    processed_f32 = rvc_processor.process_audio_block(block_f32)
+                    processed_i16 = (np.clip(processed_f32, -1.0, 1.0 - 1.0 / 32768.0) * 32768.0).astype(np.int16).tobytes()
+                    await websocket.send(processed_i16)
+                except asyncio.TimeoutError:
+                    continue  # periodically checking if we need to stop
+            logger.info(f'{log_prefix}Blocks processor stopped gracefully')
+
+        asyncio.create_task(process_blocks())
         while True:
             data = await websocket.recv()
             if isinstance(data, str):
                 print(data)
                 pass
             elif isinstance(data, bytes):
-                #np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-                #processed = rvc_processor.process_audio_block(data)
-                #await websocket.send(processed)
-                print('Received bytes')
+                buffer += data
+                while len(buffer) >= block_size:
+                    await process_blocks_queue.put(buffer[:block_size])
+                    buffer = buffer[block_size:]
             else:
                 await websocket.send(error_message('Received unrecognized data type', details_to_log=data))
                 continue
@@ -95,10 +114,12 @@ async def handler(websocket):
         logger.info(f'{log_prefix}Disconnected OK: {ex}')
     except websockets.exceptions.ConnectionClosedError as ex:
         logger.error(f'{log_prefix}Disconnected with error: {ex}')
+    finally:
+        stop_event.set()
 
 async def main():
     global rvc_processor
-    rvc_processor = realtime_rvc_processor.RVCProcessor(
+    rvc_processor = StreamRVCProcessor(
         pth_path='assets/weights/voicevox_speaker_43.pth',
         index_path='logs/voicevox_speaker_43/added_IVF567_Flat_nprobe_1_voicevox_speaker_43_v2.index',
         samplerate=24000,

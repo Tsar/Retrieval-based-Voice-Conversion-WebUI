@@ -111,7 +111,7 @@ class ProcessorConfig:
         self.n_cpu: int = min(n_cpu, 4)
         self.f0method: str = "fcpe"
 
-class RVCProcessor:
+class StreamRVCProcessor:
     def __init__(
         self,
         pth_path,
