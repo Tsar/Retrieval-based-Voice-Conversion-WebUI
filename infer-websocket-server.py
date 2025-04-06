@@ -110,12 +110,20 @@ async def handler(websocket):
         async def process_blocks():
             while not stop_event.is_set():
                 try:
-                    block_i16 = await asyncio.wait_for(process_blocks_queue.get(), timeout=1)
-                    assert len(block_i16) == block_size
-                    block_f32 = np.frombuffer(block_i16, dtype=np.int16).astype(np.float32) / 32768.0
-                    processed_f32 = rvc_processor.process_audio_block(block_f32)
-                    processed_i16 = (np.clip(processed_f32, -1.0, 1.0 - 1.0 / 32768.0) * 32768.0).astype(np.int16).tobytes()
-                    await websocket.send(processed_i16)
+                    block_i16_or_cmd = await asyncio.wait_for(process_blocks_queue.get(), timeout=1)
+                    if isinstance(block_i16_or_cmd, bytes):
+                        assert len(block_i16_or_cmd) == block_size
+                        block_f32 = np.frombuffer(block_i16_or_cmd, dtype=np.int16).astype(np.float32) / 32768.0
+                        processed_f32 = rvc_processor.process_audio_block(block_f32)
+                        processed_i16 = (np.clip(processed_f32, -1.0, 1.0 - 1.0 / 32768.0) * 32768.0).astype(np.int16).tobytes()
+                        await websocket.send(processed_i16)
+                    elif isinstance(block_i16_or_cmd, str):
+                        if block_i16_or_cmd == 'end_message':
+                            await websocket.send('end_message')
+                        else:
+                            logger.error(f'Unrecognized command in queue: {block_i16_or_cmd}')
+                    else:
+                        logger.error(f'Unrecognized data type in queue')
                 except asyncio.TimeoutError:
                     continue  # periodically checking if we need to stop
             logger.info(f'{log_prefix}Blocks processor stopped gracefully')
@@ -123,18 +131,19 @@ async def handler(websocket):
         asyncio.create_task(process_blocks())
         while True:
             data = await websocket.recv()
-            if isinstance(data, str):
-                if data == 'end_message':
-                    assert len(buffer) < block_size
-                    await process_blocks_queue.put(buffer.ljust(block_size, b'\x00'))
-                    buffer = b''
-                else:
-                    logger.error(f'{log_prefix}Unrecognized text received: "{data}"')
-            elif isinstance(data, bytes):
+            if isinstance(data, bytes):
                 buffer += data
                 while len(buffer) >= block_size:
                     await process_blocks_queue.put(buffer[:block_size])
                     buffer = buffer[block_size:]
+            elif isinstance(data, str):
+                if data == 'end_message':
+                    assert len(buffer) < block_size
+                    await process_blocks_queue.put(buffer.ljust(block_size, b'\x00'))
+                    await process_blocks_queue.put('end_message')
+                    buffer = b''
+                else:
+                    logger.error(f'{log_prefix}Unrecognized text received: "{data}"')
             else:
                 await websocket.send(error_message('Received unrecognized data type', details_to_log=data))
                 continue
