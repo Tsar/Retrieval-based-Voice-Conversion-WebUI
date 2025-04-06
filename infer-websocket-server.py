@@ -177,7 +177,7 @@ async def main():
     rvc_processor.start_vc()
 
     # Warmup
-    warmup_context = rvc_processor.create_context()
+    warmup_context = rvc_processor.create_context(pitch=0)
     rvc_processor.process_audio_block(
         context=warmup_context,
         indata=np.zeros(rvc_processor.block_frame, dtype=np.float32),
