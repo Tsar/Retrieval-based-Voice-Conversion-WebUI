@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import sys
 import re
 import random
 import time
@@ -47,12 +48,21 @@ def read_audio_files_parts():
     for audio_key in audio_map2:
         audio_parts_array = audio_map2[audio_key]
         print(f' * "{audio_key}" - {len(audio_parts_array)} parts')
-        saveToWav(filename=f'{TEST_DATA_DIR}/WHOLE_{audio_key}.wav', audioData=b''.join(audio_parts_array))
+        #saveToWav(filename=f'{TEST_DATA_DIR}/WHOLE_{audio_key}.wav', audioData=b''.join(audio_parts_array))
     return audio_map2
 
 async def main():
     audio_files_parts = read_audio_files_parts()
-    chosen_audio_key = random.choice(list(audio_files_parts.keys()))
+    if len(sys.argv) >= 2:
+        chosen_audio_key = sys.argv[1]
+        if chosen_audio_key not in audio_files_parts:
+            raise RuntimeError(f'Audio stream "{chosen_audio_key}" not found; available streams: {list(audio_files_parts.keys())}')
+        print(f'Audio stream "{chosen_audio_key}" was chosen using command line argument')
+    else:
+        chosen_audio_key = random.choice(list(audio_files_parts.keys()))
+
+    output_filename = f'{TEST_DATA_DIR}/' + (sys.argv[2] if len(sys.argv) >= 3 else 'OUTPUT.wav')
+    print(f'Output will be saved to "{output_filename}"')
 
     first_part_sent_ts = None
     first_part_received_ts = None
@@ -78,7 +88,7 @@ async def main():
                             break
                 except asyncio.TimeoutError:
                     continue  # periodically checking if we need to stop
-            saveToWav(filename=f'{TEST_DATA_DIR}/OUTPUT.wav', audioData=buffer)
+            saveToWav(filename=output_filename, audioData=buffer)
             received_total = len(buffer)
             print('Receiver stopped')
 
