@@ -357,9 +357,9 @@ class RVC:
         ctx_cache_pitch: Optional[torch.Tensor] = None,
         ctx_cache_pitchf: Optional[torch.Tensor] = None,
     ) -> np.ndarray:
-        f0_up_key = ctx_f0_up_key if ctx_f0_up_key else self.f0_up_key
-        cache_pitch_storage: torch.Tensor = ctx_cache_pitch if ctx_cache_pitch else self.cache_pitch
-        cache_pitchf_storage: torch.Tensor = ctx_cache_pitchf if ctx_cache_pitchf else self.cache_pitchf
+        f0_up_key = self.f0_up_key if ctx_f0_up_key is None else ctx_f0_up_key
+        cache_pitch_storage: torch.Tensor = self.cache_pitch if ctx_cache_pitch is None else ctx_cache_pitch
+        cache_pitchf_storage: torch.Tensor = self.cache_pitchf if ctx_cache_pitchf is None else ctx_cache_pitchf
 
         t1 = ttime()
         with torch.no_grad():
