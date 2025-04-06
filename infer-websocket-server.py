@@ -99,7 +99,8 @@ async def handler(websocket):
         return
 
     logger.info(f'{log_prefix}Starting voice conversion to {target_voice} transposed by {transpose_by}')
-    rvc_processor.rvc.change_key(transpose_by)
+
+    rvc_context = rvc_processor.create_context(pitch=transpose_by)
     block_size = rvc_processor.block_frame * 2  # because PCM16
     buffer = b''
 
@@ -114,7 +115,7 @@ async def handler(websocket):
                     if isinstance(block_i16_or_cmd, bytes):
                         assert len(block_i16_or_cmd) == block_size
                         block_f32 = np.frombuffer(block_i16_or_cmd, dtype=np.int16).astype(np.float32) / 32768.0
-                        processed_f32 = rvc_processor.process_audio_block(block_f32)
+                        processed_f32 = rvc_processor.process_audio_block(context=rvc_context, indata=block_f32)
                         processed_i16 = (np.clip(processed_f32, -1.0, 1.0 - 1.0 / 32768.0) * 32768.0).astype(np.int16).tobytes()
                         await websocket.send(processed_i16)
                     elif isinstance(block_i16_or_cmd, str):
@@ -175,7 +176,13 @@ async def main():
         pitch=12,
     )
     rvc_processor.start_vc()
-    rvc_processor.process_audio_block(np.zeros(rvc_processor.block_frame, dtype=np.float32))  # warmup
+
+    # Warmup
+    warmup_context = rvc_processor.create_context()
+    rvc_processor.process_audio_block(
+        context=warmup_context,
+        indata=np.zeros(rvc_processor.block_frame, dtype=np.float32),
+    )
 
     try:
         async with websockets.serve(handler, host='', port=7411, ssl=ssl_context) as server:

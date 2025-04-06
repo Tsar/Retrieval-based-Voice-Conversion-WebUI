@@ -2,6 +2,7 @@ from io import BytesIO
 import os
 import sys
 import traceback
+from typing import Optional
 from infer.lib import jit
 from infer.lib.jit.get_synthesizer import get_synthesizer
 from time import time as ttime
@@ -189,6 +190,7 @@ class RVC:
         except:
             printt(traceback.format_exc())
 
+    # You may pass ctx_f0_up_key to infer instead of using this
     def change_key(self, new_key):
         self.f0_up_key = new_key
 
@@ -351,7 +353,14 @@ class RVC:
         skip_head,
         return_length,
         f0method,
+        ctx_f0_up_key: Optional[int] = None,
+        ctx_cache_pitch: Optional[torch.Tensor] = None,
+        ctx_cache_pitchf: Optional[torch.Tensor] = None,
     ) -> np.ndarray:
+        f0_up_key = ctx_f0_up_key if ctx_f0_up_key else self.f0_up_key
+        cache_pitch_storage: torch.Tensor = ctx_cache_pitch if ctx_cache_pitch else self.cache_pitch
+        cache_pitchf_storage: torch.Tensor = ctx_cache_pitchf if ctx_cache_pitchf else self.cache_pitchf
+
         t1 = ttime()
         with torch.no_grad():
             if self.config.is_half:
@@ -405,15 +414,15 @@ class RVC:
             if f0method == "rmvpe":
                 f0_extractor_frame = 5120 * ((f0_extractor_frame - 1) // 5120 + 1) - 160
             pitch, pitchf = self.get_f0(
-                input_wav[-f0_extractor_frame:], self.f0_up_key - self.formant_shift, self.n_cpu, f0method
+                input_wav[-f0_extractor_frame:], f0_up_key - self.formant_shift, self.n_cpu, f0method
             )
             shift = block_frame_16k // 160
-            self.cache_pitch[:-shift] = self.cache_pitch[shift:].clone()
-            self.cache_pitchf[:-shift] = self.cache_pitchf[shift:].clone()
-            self.cache_pitch[4 - pitch.shape[0] :] = pitch[3:-1]
-            self.cache_pitchf[4 - pitch.shape[0] :] = pitchf[3:-1]
-            cache_pitch = self.cache_pitch[None, -p_len:]
-            cache_pitchf = self.cache_pitchf[None, -p_len:] * return_length2 / return_length
+            cache_pitch_storage[:-shift] = cache_pitch_storage[shift:].clone()
+            cache_pitchf_storage[:-shift] = cache_pitchf_storage[shift:].clone()
+            cache_pitch_storage[4 - pitch.shape[0] :] = pitch[3:-1]
+            cache_pitchf_storage[4 - pitch.shape[0] :] = pitchf[3:-1]
+            cache_pitch = cache_pitch_storage[None, -p_len:]
+            cache_pitchf = cache_pitchf_storage[None, -p_len:] * return_length2 / return_length
         t4 = ttime()
         feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
         feats = feats[:, :p_len, :]

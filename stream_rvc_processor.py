@@ -1,4 +1,4 @@
-# This file is a copy of gui_v1.py adjusted to use as module
+# This file is a copy of gui_v1.py adjusted to use as module and with support of parallel inferences
 
 import os
 import sys
@@ -97,6 +97,7 @@ class ProcessorConfig:
         self.pth_path: str = ""
         self.index_path: str = ""
         self.samplerate: int = 40000
+        self.channels: int = 1
         self.pitch: int = 0
         self.formant=0.0
         self.block_time: float = 0.25  # s
@@ -111,12 +112,38 @@ class ProcessorConfig:
         self.n_cpu: int = min(n_cpu, 4)
         self.f0method: str = "fcpe"
 
+class StreamRVCContext:
+    def __init__(
+        self,
+        pitch: int,
+        input_wav: torch.Tensor,
+        input_wav_denoise: torch.Tensor,
+        input_wav_res: torch.Tensor,
+        rms_buffer: np.ndarray,
+        sola_buffer: torch.Tensor,
+        nr_buffer: torch.Tensor,
+        output_buffer: torch.Tensor,
+        cache_pitch: torch.Tensor,
+        cache_pitchf: torch.Tensor,
+    ):
+        self.pitch = pitch
+        self.input_wav = input_wav
+        self.input_wav_denoise = input_wav_denoise
+        self.input_wav_res = input_wav_res
+        self.rms_buffer = rms_buffer
+        self.sola_buffer = sola_buffer
+        self.nr_buffer = nr_buffer
+        self.output_buffer = output_buffer
+        self.cache_pitch = cache_pitch
+        self.cache_pitchf = cache_pitchf
+
 class StreamRVCProcessor:
     def __init__(
         self,
         pth_path,
         index_path,
         samplerate=40000,
+        channels=1,
         threhold=-60,
         pitch=0,
         formant=0.0,
@@ -141,6 +168,7 @@ class StreamRVCProcessor:
         self.processor_config.pth_path = pth_path
         self.processor_config.index_path = index_path
         self.processor_config.samplerate = samplerate
+        self.processor_config.channels = channels
         self.processor_config.threhold = threhold
         self.processor_config.pitch = pitch
         self.processor_config.formant = formant
@@ -169,8 +197,6 @@ class StreamRVCProcessor:
             self.config,
             self.rvc if hasattr(self, "rvc") else None,
         )
-        # self.processor_config.samplerate should be already set
-        self.processor_config.channels = 1
         self.zc = self.processor_config.samplerate // 100
         self.block_frame = (
             int(
@@ -205,26 +231,6 @@ class StreamRVCProcessor:
             )
             * self.zc
         )
-        self.input_wav: torch.Tensor = torch.zeros(
-            self.extra_frame
-            + self.crossfade_frame
-            + self.sola_search_frame
-            + self.block_frame,
-            device=self.config.device,
-            dtype=torch.float32,
-        )
-        self.input_wav_denoise: torch.Tensor = self.input_wav.clone()
-        self.input_wav_res: torch.Tensor = torch.zeros(
-            160 * self.input_wav.shape[0] // self.zc,
-            device=self.config.device,
-            dtype=torch.float32,
-        )
-        self.rms_buffer: np.ndarray = np.zeros(4 * self.zc, dtype="float32")
-        self.sola_buffer: torch.Tensor = torch.zeros(
-            self.sola_buffer_frame, device=self.config.device, dtype=torch.float32
-        )
-        self.nr_buffer: torch.Tensor = self.sola_buffer.clone()
-        self.output_buffer: torch.Tensor = self.input_wav.clone()
         self.skip_head = self.extra_frame // self.zc
         self.return_length = (
             self.block_frame + self.sola_buffer_frame + self.sola_search_frame
@@ -261,15 +267,49 @@ class StreamRVCProcessor:
             sr=self.processor_config.samplerate, n_fft=4 * self.zc, prop_decrease=0.9
         ).to(self.config.device)
 
-    def process_audio_block(self, indata: np.ndarray) -> np.ndarray:
+    def create_context(self, pitch: int) -> StreamRVCContext:
+        input_wav: torch.Tensor = torch.zeros(
+            self.extra_frame
+            + self.crossfade_frame
+            + self.sola_search_frame
+            + self.block_frame,
+            device=self.config.device,
+            dtype=torch.float32,
+        )
+        input_wav_denoise: torch.Tensor = input_wav.clone()
+        input_wav_res: torch.Tensor = torch.zeros(
+            160 * input_wav.shape[0] // self.zc,
+            device=self.config.device,
+            dtype=torch.float32,
+        )
+        rms_buffer: np.ndarray = np.zeros(4 * self.zc, dtype="float32")
+        sola_buffer: torch.Tensor = torch.zeros(
+            self.sola_buffer_frame, device=self.config.device, dtype=torch.float32
+        )
+        nr_buffer: torch.Tensor = sola_buffer.clone()
+        output_buffer: torch.Tensor = input_wav.clone()
+        return StreamRVCContext(
+            pitch=pitch,
+            input_wav=input_wav,
+            input_wav_denoise=input_wav_denoise,
+            input_wav_res=input_wav_res,
+            rms_buffer=rms_buffer,
+            sola_buffer=sola_buffer,
+            nr_buffer=nr_buffer,
+            output_buffer=output_buffer,
+            cache_pitch=torch.zeros(1024, device=self.config.device, dtype=torch.long),
+            cache_pitchf=torch.zeros(1024, device=self.config.device, dtype=torch.float32),
+        )
+
+    def process_audio_block(self, context: StreamRVCContext, indata: np.ndarray) -> np.ndarray:
         start_time = time.perf_counter()
         indata = librosa.to_mono(indata.T)
         if self.processor_config.threhold > -60:
-            indata = np.append(self.rms_buffer, indata)
+            indata = np.append(context.rms_buffer, indata)
             rms = librosa.feature.rms(
                 y=indata, frame_length=4 * self.zc, hop_length=self.zc
             )[:, 2:]
-            self.rms_buffer[:] = indata[-4 * self.zc :]
+            context.rms_buffer[:] = indata[-4 * self.zc :]
             indata = indata[2 * self.zc - self.zc // 2 :]
             db_threhold = (
                 librosa.amplitude_to_db(rms, ref=1.0)[0] < self.processor_config.threhold
@@ -278,71 +318,74 @@ class StreamRVCProcessor:
                 if db_threhold[i]:
                     indata[i * self.zc : (i + 1) * self.zc] = 0
             indata = indata[self.zc // 2 :]
-        self.input_wav[: -self.block_frame] = self.input_wav[
+        context.input_wav[: -self.block_frame] = context.input_wav[
             self.block_frame :
         ].clone()
-        self.input_wav[-indata.shape[0] :] = torch.from_numpy(indata).to(
+        context.input_wav[-indata.shape[0] :] = torch.from_numpy(indata).to(
             self.config.device
         )
-        self.input_wav_res[: -self.block_frame_16k] = self.input_wav_res[
+        context.input_wav_res[: -self.block_frame_16k] = context.input_wav_res[
             self.block_frame_16k :
         ].clone()
         # input noise reduction and resampling
         if self.processor_config.I_noise_reduce:
-            self.input_wav_denoise[: -self.block_frame] = self.input_wav_denoise[
+            context.input_wav_denoise[: -self.block_frame] = context.input_wav_denoise[
                 self.block_frame :
             ].clone()
-            input_wav = self.input_wav[-self.sola_buffer_frame - self.block_frame :]
+            input_wav = context.input_wav[-self.sola_buffer_frame - self.block_frame :]
             input_wav = self.tg(
-                input_wav.unsqueeze(0), self.input_wav.unsqueeze(0)
+                input_wav.unsqueeze(0), context.input_wav.unsqueeze(0)
             ).squeeze(0)
             input_wav[: self.sola_buffer_frame] *= self.fade_in_window
             input_wav[: self.sola_buffer_frame] += (
-                self.nr_buffer * self.fade_out_window
+                context.nr_buffer * self.fade_out_window
             )
-            self.input_wav_denoise[-self.block_frame :] = input_wav[
+            context.input_wav_denoise[-self.block_frame :] = input_wav[
                 : self.block_frame
             ]
-            self.nr_buffer[:] = input_wav[self.block_frame :]
-            self.input_wav_res[-self.block_frame_16k - 160 :] = self.resampler(
-                self.input_wav_denoise[-self.block_frame - 2 * self.zc :]
+            context.nr_buffer[:] = input_wav[self.block_frame :]
+            context.input_wav_res[-self.block_frame_16k - 160 :] = self.resampler(
+                context.input_wav_denoise[-self.block_frame - 2 * self.zc :]
             )[160:]
         else:
-            self.input_wav_res[-160 * (indata.shape[0] // self.zc + 1) :] = (
-                self.resampler(self.input_wav[-indata.shape[0] - 2 * self.zc :])[
+            context.input_wav_res[-160 * (indata.shape[0] // self.zc + 1) :] = (
+                self.resampler(context.input_wav[-indata.shape[0] - 2 * self.zc :])[
                     160:
                 ]
             )
         # infer
         if self.function == "vc":
             infer_wav = self.rvc.infer(
-                self.input_wav_res,
-                self.block_frame_16k,
-                self.skip_head,
-                self.return_length,
-                self.processor_config.f0method,
+                input_wav=context.input_wav_res,
+                block_frame_16k=self.block_frame_16k,
+                skip_head=self.skip_head,
+                return_length=self.return_length,
+                f0method=self.processor_config.f0method,
+                ctx_f0_up_key=context.pitch,
+                ctx_cache_pitch=context.cache_pitch,
+                ctx_cache_pitchf=context.cache_pitchf,
             )
             if self.resampler2 is not None:
                 infer_wav = self.resampler2(infer_wav)
         elif self.processor_config.I_noise_reduce:
-            infer_wav = self.input_wav_denoise[self.extra_frame :].clone()
+            infer_wav = context.input_wav_denoise[self.extra_frame :].clone()
         else:
-            infer_wav = self.input_wav[self.extra_frame :].clone()
+            infer_wav = context.input_wav[self.extra_frame :].clone()
         # output noise reduction
         if self.processor_config.O_noise_reduce and self.function == "vc":
-            self.output_buffer[: -self.block_frame] = self.output_buffer[
+            context.output_buffer[: -self.block_frame] = context.output_buffer[
                 self.block_frame :
             ].clone()
-            self.output_buffer[-self.block_frame :] = infer_wav[-self.block_frame :]
+            context.output_buffer[-self.block_frame :] = infer_wav[-self.block_frame :]
             infer_wav = self.tg(
-                infer_wav.unsqueeze(0), self.output_buffer.unsqueeze(0)
+                infer_wav.unsqueeze(0), context.output_buffer.unsqueeze(0)
             ).squeeze(0)
         # volume envelop mixing
         if self.processor_config.rms_mix_rate < 1 and self.function == "vc":
             if self.processor_config.I_noise_reduce:
-                input_wav = self.input_wav_denoise[self.extra_frame :]
+                input_wav = context.input_wav_denoise[self.extra_frame :]
             else:
-                input_wav = self.input_wav[self.extra_frame :]
+                input_wav = context.input_wav[self.extra_frame :]
             rms1 = librosa.feature.rms(
                 y=input_wav[: infer_wav.shape[0]].cpu().numpy(),
                 frame_length=4 * self.zc,
@@ -375,7 +418,7 @@ class StreamRVCProcessor:
         conv_input = infer_wav[
             None, None, : self.sola_buffer_frame + self.sola_search_frame
         ]
-        cor_nom = F.conv1d(conv_input, self.sola_buffer[None, None, :])
+        cor_nom = F.conv1d(conv_input, context.sola_buffer[None, None, :])
         cor_den = torch.sqrt(
             F.conv1d(
                 conv_input**2,
@@ -393,16 +436,16 @@ class StreamRVCProcessor:
         if "privateuseone" in str(self.config.device) or not self.processor_config.use_pv:
             infer_wav[: self.sola_buffer_frame] *= self.fade_in_window
             infer_wav[: self.sola_buffer_frame] += (
-                self.sola_buffer * self.fade_out_window
+                context.sola_buffer * self.fade_out_window
             )
         else:
             infer_wav[: self.sola_buffer_frame] = phase_vocoder(
-                self.sola_buffer,
+                context.sola_buffer,
                 infer_wav[: self.sola_buffer_frame],
                 self.fade_out_window,
                 self.fade_in_window,
             )
-        self.sola_buffer[:] = infer_wav[
+        context.sola_buffer[:] = infer_wav[
             self.block_frame : self.block_frame + self.sola_buffer_frame
         ]
 
