@@ -71,7 +71,7 @@ async def handler(websocket):
     target_voice = params['target_voice'][0]
     if target_voice not in TARGET_VOICES_PITCH:
         await websocket.send(error_message(
-            f'Unsupported target_voice, only the following are supported: {TARGET_VOICES_PITCH.keys()}',
+            f'Unsupported target_voice, only the following are supported: {list(TARGET_VOICES_PITCH.keys())}',
             log_prefix=log_prefix,
             details_to_log=params,
         ))
@@ -88,7 +88,7 @@ async def handler(websocket):
         input_voice = params['input_voice'][0]
         if input_voice not in INPUT_VOICES_PITCH:
             await websocket.send(error_message(
-                f'Unsupported input_voice, only the following are supported: {INPUT_VOICES_PITCH.keys()}',
+                f'Unsupported input_voice, only the following are supported: {list(INPUT_VOICES_PITCH.keys())}',
                 log_prefix=log_prefix,
                 details_to_log=params,
             ))
