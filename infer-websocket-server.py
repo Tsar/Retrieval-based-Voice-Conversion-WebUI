@@ -7,11 +7,12 @@ import uuid
 import logging
 from urllib.parse import urlparse, parse_qs
 from typing import Optional
+from concurrent.futures import ProcessPoolExecutor
 import asyncio
 import websockets
 import numpy as np
 
-from stream_rvc_processor import StreamRVCProcessor
+from stream_rvc_processor import StreamRVCProcessor, StreamRVCContext
 
 logger = logging.getLogger('infer-websocket-stream')
 
@@ -34,6 +35,7 @@ TARGET_VOICES_PITCH = {
 }
 
 rvc_processor: Optional[StreamRVCProcessor] = None
+executor = ProcessPoolExecutor()
 
 def error_message(message, log_prefix='', details_to_log=None):
     if details_to_log:
@@ -41,6 +43,12 @@ def error_message(message, log_prefix='', details_to_log=None):
     else:
         logger.error(f'{log_prefix}{message}')
     return json.dumps({'error': message})
+
+def run_inference(rvc_context: StreamRVCContext, block_i16: bytes) -> bytes:
+    block_f32 = np.frombuffer(block_i16, dtype=np.int16).astype(np.float32) / 32768.0
+    processed_f32 = rvc_processor.process_audio_block(context=rvc_context, indata=block_f32)
+    processed_i16 = (np.clip(processed_f32, -1.0, 1.0 - 1.0 / 32768.0) * 32768.0).astype(np.int16).tobytes()
+    return processed_i16
 
 async def handler(websocket):
     session_id = str(uuid.uuid4())
@@ -111,18 +119,17 @@ async def handler(websocket):
         async def process_blocks():
             while not stop_event.is_set():
                 try:
-                    block_i16_or_cmd = await asyncio.wait_for(process_blocks_queue.get(), timeout=1)
-                    if isinstance(block_i16_or_cmd, bytes):
-                        assert len(block_i16_or_cmd) == block_size
-                        block_f32 = np.frombuffer(block_i16_or_cmd, dtype=np.int16).astype(np.float32) / 32768.0
-                        processed_f32 = rvc_processor.process_audio_block(context=rvc_context, indata=block_f32)
-                        processed_i16 = (np.clip(processed_f32, -1.0, 1.0 - 1.0 / 32768.0) * 32768.0).astype(np.int16).tobytes()
-                        await websocket.send(processed_i16)
-                    elif isinstance(block_i16_or_cmd, str):
-                        if block_i16_or_cmd == 'end_message':
+                    block_or_cmd = await asyncio.wait_for(process_blocks_queue.get(), timeout=1)
+                    if isinstance(block_or_cmd, bytes):
+                        assert len(block_or_cmd) == block_size
+                        loop = asyncio.get_running_loop()
+                        processed = await loop.run_in_executor(executor, run_inference, rvc_context, block_or_cmd)
+                        await websocket.send(processed)
+                    elif isinstance(block_or_cmd, str):
+                        if block_or_cmd == 'end_message':
                             await websocket.send('end_message')
                         else:
-                            logger.error(f'Unrecognized command in queue: {block_i16_or_cmd}')
+                            logger.error(f'Unrecognized command in queue: {block_or_cmd}')
                     else:
                         logger.error(f'Unrecognized data type in queue')
                 except asyncio.TimeoutError:

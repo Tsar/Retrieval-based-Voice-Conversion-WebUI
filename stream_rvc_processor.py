@@ -1,4 +1,4 @@
-# This file is a copy of gui_v1.py adjusted to use as module and with support of parallel inferences
+# This file is created from gui_v1.py: adjusted to use as module and with support of parallel inferences
 
 import os
 import sys
@@ -447,7 +447,7 @@ class StreamRVCProcessor:
         ]
 
         total_time = time.perf_counter() - start_time
-        printt("Infer time: %.2f", total_time)
+        printt("Infer time: %.2f ms", total_time * 1000)
 
         return (
             infer_wav[: self.block_frame]
