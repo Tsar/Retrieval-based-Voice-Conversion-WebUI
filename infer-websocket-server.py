@@ -173,7 +173,6 @@ async def main():
         pth_path='assets/weights/voicevox_speaker_43.pth',
         index_path='logs/voicevox_speaker_43/added_IVF567_Flat_nprobe_1_voicevox_speaker_43_v2.index',
         samplerate=24000,
-        pitch=12,
     )
     rvc_processor.start_vc()
 

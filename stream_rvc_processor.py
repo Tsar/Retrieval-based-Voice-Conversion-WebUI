@@ -98,7 +98,6 @@ class ProcessorConfig:
         self.index_path: str = ""
         self.samplerate: int = 40000
         self.channels: int = 1
-        self.pitch: int = 0
         self.formant=0.0
         self.block_time: float = 0.25  # s
         self.threhold: int = -60
@@ -145,7 +144,6 @@ class StreamRVCProcessor:
         samplerate=40000,
         channels=1,
         threhold=-60,
-        pitch=0,
         formant=0.0,
         block_time=0.15,
         crossfade_time=0.08,
@@ -170,7 +168,6 @@ class StreamRVCProcessor:
         self.processor_config.samplerate = samplerate
         self.processor_config.channels = channels
         self.processor_config.threhold = threhold
-        self.processor_config.pitch = pitch
         self.processor_config.formant = formant
         self.processor_config.block_time = block_time
         self.processor_config.crossfade_time = crossfade_time
@@ -186,16 +183,16 @@ class StreamRVCProcessor:
     def start_vc(self):
         torch.cuda.empty_cache()
         self.rvc = rvc_for_realtime.RVC(
-            self.processor_config.pitch,
-            self.processor_config.formant,
-            self.processor_config.pth_path,
-            self.processor_config.index_path,
-            self.processor_config.index_rate,
-            self.processor_config.n_cpu,
-            inp_q,
-            opt_q,
-            self.config,
-            self.rvc if hasattr(self, "rvc") else None,
+            key=0,  # will use context.pitch in infer
+            formant=self.processor_config.formant,
+            pth_path=self.processor_config.pth_path,
+            index_path=self.processor_config.index_path,
+            index_rate=self.processor_config.index_rate,
+            n_cpu=self.processor_config.n_cpu,
+            inp_q=inp_q,
+            opt_q=opt_q,
+            config=self.config,
+            last_rvc=self.rvc if hasattr(self, "rvc") else None,
         )
         self.zc = self.processor_config.samplerate // 100
         self.block_frame = (
