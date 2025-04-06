@@ -70,7 +70,6 @@ class Harvest(multiprocessing.Process):
                 self.opt_q.put(ts)
 
 
-import multiprocessing
 import time
 from multiprocessing import Queue, cpu_count
 
@@ -83,14 +82,6 @@ import torchaudio.transforms as tat
 
 from infer.lib import rtrvc as rvc_for_realtime
 from configs.config import Config
-
-inp_q = Queue()
-opt_q = Queue()
-n_cpu = min(cpu_count(), 8)
-for _ in range(n_cpu):
-    p = Harvest(inp_q, opt_q)
-    p.daemon = True
-    p.start()
 
 class ProcessorConfig:
     def __init__(self) -> None:
@@ -108,7 +99,7 @@ class ProcessorConfig:
         self.use_pv: bool = False
         self.rms_mix_rate: float = 0.0
         self.index_rate: float = 0.0
-        self.n_cpu: int = min(n_cpu, 4)
+        self.n_cpu: int = min(cpu_count(), 8)
         self.f0method: str = "fcpe"
 
 class StreamRVCContext:
@@ -180,6 +171,14 @@ class StreamRVCProcessor:
         self.processor_config.n_cpu = n_cpu
         self.processor_config.f0method = f0method
 
+        # Launch harvest threads (is this really needed?)
+        self.inp_q = Queue()
+        self.opt_q = Queue()
+        for _ in range(min(cpu_count(), 8)):
+            p = Harvest(self.inp_q, self.opt_q)
+            p.daemon = True
+            p.start()
+
     def start_vc(self):
         torch.cuda.empty_cache()
         self.rvc = rvc_for_realtime.RVC(
@@ -189,8 +188,8 @@ class StreamRVCProcessor:
             index_path=self.processor_config.index_path,
             index_rate=self.processor_config.index_rate,
             n_cpu=self.processor_config.n_cpu,
-            inp_q=inp_q,
-            opt_q=opt_q,
+            inp_q=self.inp_q,
+            opt_q=self.opt_q,
             config=self.config,
             last_rvc=self.rvc if hasattr(self, "rvc") else None,
         )
