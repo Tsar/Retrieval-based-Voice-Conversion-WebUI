@@ -7,7 +7,7 @@ import uuid
 import logging
 from urllib.parse import urlparse, parse_qs
 from typing import Optional
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import websockets
 import numpy as np
@@ -35,7 +35,7 @@ TARGET_VOICES_PITCH = {
 }
 
 rvc_processor: Optional[StreamRVCProcessor] = None
-executor = ProcessPoolExecutor()
+executor = ThreadPoolExecutor(max_workers=16)
 
 def error_message(message, log_prefix='', details_to_log=None):
     if details_to_log:
