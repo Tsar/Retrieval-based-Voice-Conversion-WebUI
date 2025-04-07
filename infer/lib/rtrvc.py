@@ -26,6 +26,9 @@ from configs.config import Config
 
 # config = Config()
 
+mm = M()
+
+
 def printt(strr, *args):
     if len(args) == 0:
         print(strr)
@@ -62,7 +65,6 @@ class RVC:
 
                 fairseq.modules.grad_multiply.GradMultiply.forward = forward_dml
             # global config
-            self.mm = M()
             self.config = config
             self.inp_q = inp_q
             self.opt_q = opt_q
@@ -258,7 +260,7 @@ class RVC:
         part_length = 160 * ((length // 160 - 1) // n_cpu + 1)
         n_cpu = (length // 160 - 1) // (part_length // 160) + 1
         ts = ttime()
-        res_f0 = self.mm.dict()
+        res_f0 = mm.dict()
         for idx in range(n_cpu):
             tail = part_length * (idx + 1) + 320
             if idx == 0:

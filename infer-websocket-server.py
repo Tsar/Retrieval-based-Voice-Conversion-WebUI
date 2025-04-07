@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import torch
 import os
 import json
 import ssl
@@ -36,7 +35,7 @@ TARGET_VOICES_PITCH = {
 }
 
 rvc_processor: Optional[StreamRVCProcessor] = None
-executor: Optional[ProcessPoolExecutor] = None
+executor = ProcessPoolExecutor()
 
 def error_message(message, log_prefix='', details_to_log=None):
     if details_to_log:
@@ -191,9 +190,6 @@ async def main():
         indata=np.zeros(rvc_processor.block_frame, dtype=np.float32),
     )
 
-    global executor
-    executor = ProcessPoolExecutor()
-
     try:
         async with websockets.serve(handler, host='', port=7411, ssl=ssl_context) as server:
             logger.info('WebSocket server started')
@@ -204,5 +200,4 @@ async def main():
         logger.info('WebSocket server stopped')
 
 if __name__ == '__main__':
-    torch.multiprocessing.set_start_method('spawn', force=True)
     asyncio.run(main())
