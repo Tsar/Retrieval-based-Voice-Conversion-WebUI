@@ -4,6 +4,7 @@ import os
 import sys
 import re
 import random
+import itertools
 import time
 import asyncio
 import websockets
@@ -20,9 +21,9 @@ URL = f'ws://localhost:7411/v1/voice_conversion?input_voice={INPUT_VOICE}&target
 
 TEST_DATA_DIR = 'websocket-test-client-data'
 
-def saveToWav(filename, audioData, sampleRate=24000, subtype='PCM_16'):
-    soundfile.write(filename, np.frombuffer(audioData, dtype=np.int16), sampleRate, subtype=subtype)
-    print(f'Saved "{filename}" with {len(audioData)} bytes of audio data')
+def save_to_wav(log_prefix, filename, audio_data, sample_rate=24000, subtype='PCM_16'):
+    soundfile.write(filename, np.frombuffer(audio_data, dtype=np.int16), sample_rate, subtype=subtype)
+    print(f'{log_prefix}Saved "{filename}" with {len(audio_data)} bytes of audio data')
 
 def read_audio_files_parts():
     audio_map = {}
@@ -49,21 +50,11 @@ def read_audio_files_parts():
         audio_parts_array = audio_map2[audio_key]
         print(f' * "{audio_key}" - {len(audio_parts_array)} parts')
         #saveToWav(filename=f'{TEST_DATA_DIR}/WHOLE_{audio_key}.wav', audioData=b''.join(audio_parts_array))
+    print()
     return audio_map2
 
-async def main():
-    audio_files_parts = read_audio_files_parts()
-    if len(sys.argv) >= 2:
-        chosen_audio_key = sys.argv[1]
-        if chosen_audio_key not in audio_files_parts:
-            raise RuntimeError(f'Audio stream "{chosen_audio_key}" not found; available streams: {list(audio_files_parts.keys())}')
-        print(f'Audio stream "{chosen_audio_key}" was chosen using command line argument')
-    else:
-        chosen_audio_key = random.choice(list(audio_files_parts.keys()))
-
-    output_filename = f'{TEST_DATA_DIR}/' + (sys.argv[2] if len(sys.argv) >= 3 else 'OUTPUT.wav')
-    print(f'Output will be saved to "{output_filename}"')
-
+async def run_test_client(client_num, audio_key, audio_parts, output_filename):
+    log_prefix = f'[client {client_num:02d}] '
     first_part_sent_ts = None
     first_part_received_ts = None
     end_message_received_ts = None
@@ -73,29 +64,31 @@ async def main():
         async def receiver():
             nonlocal first_part_received_ts, end_message_received_ts, received_total
             buffer = b''
+            data_num = 1
             while True:
                 try:
                     data = await asyncio.wait_for(websocket.recv(), timeout=1)
                     if isinstance(data, bytes):
                         if first_part_received_ts is None:
                             first_part_received_ts = time.time()
-                        print(f'Received data of size {len(data)}')
+                        print(f'{log_prefix}Received data {data_num} of size {len(data)}')
                         buffer += data
+                        data_num += 1
                     elif isinstance(data, str):
                         if data == 'end_message':
                             end_message_received_ts = time.time()
-                            print('Received end_message')
+                            print(f'{log_prefix}Received end_message')
                             break
                 except asyncio.TimeoutError:
                     continue  # periodically checking if we need to stop
-            saveToWav(filename=output_filename, audioData=buffer)
+            save_to_wav(log_prefix=log_prefix, filename=output_filename, audio_data=buffer)
             received_total = len(buffer)
-            print('Receiver stopped')
+            print(f'{log_prefix}Receiver stopped')
 
         receive_task = asyncio.create_task(receiver())
         sent_total = 0
-        for i, audio_part in enumerate(audio_files_parts[chosen_audio_key], start=1):
-            print(f'Sending "{chosen_audio_key}", part {i}, size {len(audio_part)}')
+        for i, audio_part in enumerate(audio_parts, start=1):
+            print(f'{log_prefix}Sending "{audio_key}", part {i}, size {len(audio_part)}')
             await websocket.send(audio_part)
             sent_total += len(audio_part)
             if first_part_sent_ts is None:
@@ -105,14 +98,50 @@ async def main():
         await websocket.send('end_message')
         end_message_sent_ts = time.time()
         await receive_task
-        print(f'Delay from first part sent till first part received: {(first_part_received_ts - first_part_sent_ts) * 1000:.2f} ms')
-        print(f'Sending all parts took: {(end_message_sent_ts - first_part_sent_ts) * 1000:.2f} ms')
+
         receiving_elapsed = end_message_received_ts - first_part_received_ts
-        print(f'Receiving all parts took: {receiving_elapsed * 1000:.2f} ms')
-        print(f'Original audio duration: {sent_total / 24000 / 2:.3f} s')
         received_audio_duration = received_total / 24000 / 2
-        print(f'Received audio duration: {received_audio_duration:.3f} s')
-        print(f'Receiving was {received_audio_duration / receiving_elapsed:.2f} times faster than realtime')
+        result = [
+            f'============= {log_prefix}REPORT =============',
+            f'Delay from first part sent till first part received: {(first_part_received_ts - first_part_sent_ts) * 1000:.2f} ms',
+            f'Sending all parts took: {(end_message_sent_ts - first_part_sent_ts) * 1000:.2f} ms',
+            f'Receiving all parts took: {receiving_elapsed * 1000:.2f} ms',
+            f'Original audio duration: {sent_total / 24000 / 2:.3f} s',
+            f'Received audio duration: {received_audio_duration:.3f} s',
+            f'Receiving was {received_audio_duration / receiving_elapsed:.2f} times faster than realtime',
+            f'==============================================',
+        ]
+        print(log_prefix + f'\n{log_prefix}'.join(result))
+
+async def try_run_test_client(client_num, audio_key, audio_parts, output_filename):
+    try:
+        await run_test_client(client_num, audio_key, audio_parts, output_filename)
+    except Exception as ex:
+        print(f'CLIENT {client_num:02d} DIED WITH EXCEPTION: {ex}')
+
+async def main():
+    if len(sys.argv) < 2:
+        print(f'Usage: {sys.argv[0]} <number_of_parallel_clients>')
+        return 1
+    try:
+        clients_count = int(sys.argv[1])
+    except ValueError:
+        print(f'Usage: {sys.argv[0]} <number_of_parallel_clients>')
+        return 1
+
+    audio_files_parts = read_audio_files_parts()
+
+    shuffled_keys = list(audio_files_parts.keys())
+    random.shuffle(shuffled_keys)
+    audio_keys = list(itertools.islice(itertools.cycle(shuffled_keys), clients_count))
+
+    tasks = [try_run_test_client(
+        client_num=i,
+        audio_key=audio_key,
+        audio_parts=audio_files_parts[audio_key],
+        output_filename=f'{TEST_DATA_DIR}/output_{i:02d}.wav'
+    ) for i, audio_key in enumerate(audio_keys, start=1)]
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 if __name__ == '__main__':
     asyncio.run(main())
