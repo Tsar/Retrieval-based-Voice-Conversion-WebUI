@@ -20,6 +20,8 @@ BEARER_PREFIX = 'Bearer '
 
 AUTH_TOKEN = os.environ['AUTH_TOKEN']
 
+PORT = int(os.environ.get('PORT', 7411))
+
 SSL_CERT = os.environ.get('SSL_CERT_FILENAME')
 SSL_KEY  = os.environ.get('SSL_KEY_FILENAME')
 ALLOW_UNENCRYPTED_SERVING = int(os.environ.get('ALLOW_UNENCRYPTED_SERVING', 0))
@@ -191,8 +193,8 @@ async def main():
     )
 
     try:
-        async with websockets.serve(handler, host='', port=7411, ssl=ssl_context) as server:
-            logger.info('WebSocket server started')
+        async with websockets.serve(handler, host='', port=PORT, ssl=ssl_context) as server:
+            logger.info(f'WebSocket server started on port {PORT}')
             await server.serve_forever()
     except Exception as e:
         logger.error('Unhandled exception', exc_info=e)
