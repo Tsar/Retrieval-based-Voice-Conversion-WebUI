@@ -15,9 +15,11 @@ BEARER_PREFIX = 'Bearer '
 
 AUTH_TOKEN = os.environ['AUTH_TOKEN']
 
+PORT = int(os.environ.get('PORT', 7411))
+
 INPUT_VOICE = 'sage'
 TARGET_VOICE = 'voicevox_speaker_43'
-URL = f'ws://localhost:7411/v1/voice_conversion?input_voice={INPUT_VOICE}&target_voice={TARGET_VOICE}'
+URL = f'ws://localhost:{PORT}/v1/voice_conversion?input_voice={INPUT_VOICE}&target_voice={TARGET_VOICE}'
 
 TEST_DATA_DIR = 'websocket-test-client-data'
 
