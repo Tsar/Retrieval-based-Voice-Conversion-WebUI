@@ -4,6 +4,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+from time import perf_counter
 import numpy as np
 import torch
 from torch import nn
@@ -526,6 +527,7 @@ class GeneratorNSF(torch.nn.Module):
         g: Optional[torch.Tensor] = None,
         n_res: Optional[torch.Tensor] = None,
     ):
+        t0 = perf_counter()
         har_source, noi_source, uv = self.m_source(f0, self.upp)
         har_source = har_source.transpose(1, 2)
         if n_res is not None:
@@ -540,27 +542,72 @@ class GeneratorNSF(torch.nn.Module):
             x = x + self.cond(g)
         # torch.jit.script() does not support direct indexing of torch modules
         # That's why I wrote this
+        t1 = perf_counter()
+
+        d1 = 0.0
+        d2 = 0.0
+        d3 = 0.0
+        d4 = 0.0
+        d5 = 0.0
+        d6 = 0.0
+        d7 = 0.0
         for i, (ups, noise_convs) in enumerate(zip(self.ups, self.noise_convs)):
             if i < self.num_upsamples:
+                #print(f'DBG: at cycle start   x.shape: {x.shape}')
+                ct0 = perf_counter()
                 x = F.leaky_relu(x, self.lrelu_slope)
+                #print(f'DBG: after leaky_relu x.shape: {x.shape}')
+                ct1 = perf_counter()
                 x = ups(x)
+                #print(f'DBG: after ups        x.shape: {x.shape}')
+                #print(f'DBG: ups: {ups}')
+                ct2 = perf_counter()
                 x_source = noise_convs(har_source)
+                ct3 = perf_counter()
                 x = x + x_source
+                ct4 = perf_counter()
                 xs: Optional[torch.Tensor] = None
                 l = [i * self.num_kernels + j for j in range(self.num_kernels)]
+                ct5 = perf_counter()
                 for j, resblock in enumerate(self.resblocks):
                     if j in l:
                         if xs is None:
                             xs = resblock(x)
                         else:
                             xs += resblock(x)
+                ct6 = perf_counter()
                 # This assertion cannot be ignored! \
                 # If ignored, it will cause torch.jit.script() compilation errors
                 assert isinstance(xs, torch.Tensor)
                 x = xs / self.num_kernels
+                ct7 = perf_counter()
+
+                d1 += (ct1 - ct0)
+                d2 += (ct2 - ct1)
+                d3 += (ct3 - ct2)
+                d4 += (ct4 - ct3)
+                d5 += (ct5 - ct4)
+                d6 += (ct6 - ct5)
+                d7 += (ct7 - ct6)
+
+        t2 = perf_counter()
         x = F.leaky_relu(x)
         x = self.conv_post(x)
         x = torch.tanh(x)
+        t3 = perf_counter()
+
+        print(
+            f'[GeneratorNSF timings]\n'
+            f' all except cycle : {(t1 - t0 + t3 - t2) * 1000:.2f} ms\n'
+            f' cycle            : {(t2 - t1) * 1000:.2f} ms\n'
+            f'   - leaky_relu   : {d1 * 1000:.2f} ms\n'
+            f'   - ups          : {d2 * 1000:.2f} ms\n'
+            f'   - noise_convs  : {d3 * 1000:.2f} ms\n'
+            f'   - x + x_source : {d4 * 1000:.2f} ms\n'
+            f'   - l = []       : {d5 * 1000:.2f} ms\n'
+            f'   - resblock for : {d6 * 1000:.2f} ms\n'
+            f'   - div          : {d7 * 1000:.2f} ms'
+        )
 
         return x
 
@@ -754,6 +801,7 @@ class SynthesizerTrnMs256NSFsid(nn.Module):
         return_length: Optional[torch.Tensor] = None,
         return_length2: Optional[torch.Tensor] = None,
     ):
+        t0 = perf_counter()
         g = self.emb_g(sid).unsqueeze(-1)
         if skip_head is not None and return_length is not None:
             assert isinstance(skip_head, torch.Tensor)
@@ -772,7 +820,16 @@ class SynthesizerTrnMs256NSFsid(nn.Module):
             m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths)
             z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
             z = self.flow(z_p, x_mask, g=g, reverse=True)
+        t1 = perf_counter()
         o = self.dec(z * x_mask, nsff0, g=g, n_res=return_length2)
+        t2 = perf_counter()
+
+        print(
+            f'[infer timings]\n'
+            f' all except GeneratorNSF: {(t1 - t0) * 1000:.2f} ms\n'
+            f' GeneratorNSF           : {(t2 - t1) * 1000:.2f} ms'
+        )
+
         return o, x_mask, (z, z_p, m_p, logs_p)
 
 

@@ -7,6 +7,7 @@ logger = logging.getLogger(__name__)
 
 from functools import lru_cache
 from time import time as ttime
+from time import perf_counter
 
 import faiss
 import librosa
@@ -80,6 +81,7 @@ class Pipeline(object):
         self.t_center = self.sr * self.x_center  # 查询切点位置
         self.t_max = self.sr * self.x_max  # 免查询时长阈值
         self.device = config.device
+        self.B = 1
 
     def get_f0(
         self,
@@ -267,8 +269,31 @@ class Pipeline(object):
         p_len = torch.tensor([p_len], device=self.device).long()
         with torch.no_grad():
             hasp = pitch is not None and pitchf is not None
+
+            B = self.B
+            self.B = 10 if self.B == 1 else 1
+            feats = feats.repeat(B, 1, 1)
+            p_len = p_len.repeat(B)
+            pitch = pitch.repeat(B, 1)
+            pitchf = pitchf.repeat(B, 1)
+            sid = sid.repeat(B)
+
+            print(
+                f'DBG: infer args:\n * feats.shape: {feats.shape}\n * p_len = {p_len}\n'
+                f' * pitch.shape: {pitch.shape}\n * pitchf.shape: {pitchf.shape}\n * sid = {sid}'
+            )
+
             arg = (feats, p_len, pitch, pitchf, sid) if hasp else (feats, p_len, sid)
-            audio1 = (net_g.infer(*arg)[0][0, 0]).data.cpu().float().numpy()
+
+            infer_start = perf_counter()
+            result = net_g.infer(*arg)[0]
+            infer_end = perf_counter()
+
+            print(f'DBG: infer time: {(infer_end - infer_start) * 1000:.2f} ms')
+            print(f'DBG: result.shape: {result.shape}')
+
+            audio1 = (result[5, 0]).data.cpu().float().numpy()
+
             del hasp, arg
         del feats, p_len, padding_mask
         if torch.cuda.is_available():
