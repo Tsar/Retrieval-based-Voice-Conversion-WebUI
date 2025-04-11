@@ -14,7 +14,7 @@ import numpy as np
 
 from stream_rvc_processor import StreamRVCProcessor, StreamRVCContext
 
-logger = logging.getLogger('infer-websocket-stream')
+logger = logging.getLogger('infer-websocket-server')
 
 BEARER_PREFIX = 'Bearer '
 
