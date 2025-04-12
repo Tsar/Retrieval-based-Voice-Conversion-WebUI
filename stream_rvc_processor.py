@@ -149,7 +149,6 @@ class StreamRVCProcessor:
     ) -> None:
         self.processor_config = ProcessorConfig()
         self.config = Config()
-        self.function = "vc"
         self.delay_time = 0
         self.stream = None
 
@@ -350,25 +349,20 @@ class StreamRVCProcessor:
                 ]
             )
         # infer
-        if self.function == "vc":
-            infer_wav = self.rvc.infer(
-                input_wav=context.input_wav_res,
-                block_frame_16k=self.block_frame_16k,
-                skip_head=self.skip_head,
-                return_length=self.return_length,
-                f0method=self.processor_config.f0method,
-                ctx_f0_up_key=context.pitch,
-                ctx_cache_pitch=context.cache_pitch,
-                ctx_cache_pitchf=context.cache_pitchf,
-            )
-            if self.resampler2 is not None:
-                infer_wav = self.resampler2(infer_wav)
-        elif self.processor_config.I_noise_reduce:
-            infer_wav = context.input_wav_denoise[self.extra_frame :].clone()
-        else:
-            infer_wav = context.input_wav[self.extra_frame :].clone()
+        infer_wav = self.rvc.infer(
+            input_wav=context.input_wav_res,
+            block_frame_16k=self.block_frame_16k,
+            skip_head=self.skip_head,
+            return_length=self.return_length,
+            f0method=self.processor_config.f0method,
+            ctx_f0_up_key=context.pitch,
+            ctx_cache_pitch=context.cache_pitch,
+            ctx_cache_pitchf=context.cache_pitchf,
+        )
+        if self.resampler2 is not None:
+            infer_wav = self.resampler2(infer_wav)
         # output noise reduction
-        if self.processor_config.O_noise_reduce and self.function == "vc":
+        if self.processor_config.O_noise_reduce:
             context.output_buffer[: -self.block_frame] = context.output_buffer[
                 self.block_frame :
             ].clone()
@@ -377,7 +371,7 @@ class StreamRVCProcessor:
                 infer_wav.unsqueeze(0), context.output_buffer.unsqueeze(0)
             ).squeeze(0)
         # volume envelop mixing
-        if self.processor_config.rms_mix_rate < 1 and self.function == "vc":
+        if self.processor_config.rms_mix_rate < 1:
             if self.processor_config.I_noise_reduce:
                 input_wav = context.input_wav_denoise[self.extra_frame :]
             else:
