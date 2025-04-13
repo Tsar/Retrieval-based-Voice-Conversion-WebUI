@@ -312,16 +312,17 @@ async def net_g_inference_worker(net_g: nn.Module, tasks_queue: asyncio.Priority
 
         logger.info(f'Running net_g inference for batch of size {B}')
         inference_start_ts = time.perf_counter()
-        infered_audio_batch, _, _ = net_g.infer(
-            feats,
-            p_len,
-            cache_pitch,
-            cache_pitchf,
-            sid,
-            skip_head,
-            return_length,
-            return_length2,
-        )
+        with torch.no_grad():
+            infered_audio_batch, _, _ = net_g.infer(
+                feats,
+                p_len,
+                cache_pitch,
+                cache_pitchf,
+                sid,
+                skip_head,
+                return_length,
+                return_length2,
+            )
         inference_end_ts = time.perf_counter()
         assert infered_audio_batch.size(0) == B
         logger.info(
