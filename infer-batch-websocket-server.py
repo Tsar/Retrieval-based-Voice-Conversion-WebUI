@@ -100,7 +100,7 @@ FADE_IN_WINDOW: torch.Tensor = (
 )
 FADE_OUT_WINDOW: torch.Tensor = 1 - FADE_IN_WINDOW
 
-class ClientContext:
+class SessionSettings:
     def __init__(self, pitch: int, formant_shift: float = 0.0):
         self.pitch = pitch
         self.formant_shift = formant_shift
@@ -387,38 +387,38 @@ async def net_g_inference_worker(net_g: nn.Module, tasks_queue: PriorityQueue[Ne
             f'waited: {(t1 - t0) * 1000:.1f} ms'
         )
 
-# Should be executed sequentially for each PreprocessContext, can be executed in parallel for different contexts
+# Should be executed sequentially for each context, can be executed in parallel for different contexts
 def prepare_hubert_and_fcpe_tasks(
-    client_context: ClientContext,
-    preprocess_context: PreprocessContext,
+    settings: SessionSettings,
+    context: PreprocessContext,
     block_i16: bytes,
     priority: int,
     is_last_for_message: bool,
     hubert_future: asyncio.Future,
     fcpe_future: asyncio.Future,
 ) -> tuple[HubertTask, FcpeTask]:
-    preprocess_context.prepare_input_buffers(block_i16=block_i16)
+    context.prepare_input_buffers(block_i16=block_i16)
     hubert_task = HubertTask(
         priority=priority,
         sequence=next(global_sequence),
         is_last_for_message=is_last_for_message,
         future=hubert_future,
-        input_wav=preprocess_context.input_wav_res.clone(),
+        input_wav=context.input_wav_res.clone(),
     )
     fcpe_task = FcpeTask(
         priority=priority,
         sequence=next(global_sequence),
         is_last_for_message=is_last_for_message,
         future=fcpe_future,
-        input_wav=preprocess_context.input_wav_res[-F0_EXTRACTOR_FRAME:].clone(),
-        f0_up_key=client_context.pitch - client_context.formant_shift,
+        input_wav=context.input_wav_res[-F0_EXTRACTOR_FRAME:].clone(),
+        f0_up_key=settings.pitch - settings.formant_shift,
     )
     return hubert_task, fcpe_task
 
-# Should be executed sequentially for each IntermediateContext, can be executed in parallel for different contexts
+# Should be executed sequentially for each context, can be executed in parallel for different contexts
 def prepare_net_g_task(
-    client_context: ClientContext,
-    intermediate_context: IntermediateContext,
+    settings: SessionSettings,
+    context: IntermediateContext,
     priority: int,
     is_last_for_message: bool,
     f0_up_key: float,
@@ -432,9 +432,9 @@ def prepare_net_g_task(
     feats = feats[:, :P_LEN, :]
 
     pitch, pitchf = create_pitch_and_pitchf(f0, f0_up_key)
-    intermediate_context.update_pitch_caches(pitch, pitchf)
-    cache_pitch = intermediate_context.cache_pitch[None, -P_LEN:]
-    cache_pitchf = intermediate_context.cache_pitchf[None, -P_LEN:] * client_context.return_length2 / RETURN_LENGTH
+    context.update_pitch_caches(pitch, pitchf)
+    cache_pitch = context.cache_pitch[None, -P_LEN:]
+    cache_pitchf = context.cache_pitchf[None, -P_LEN:] * settings.return_length2 / RETURN_LENGTH
 
     net_g_task = NetGTask(
         priority=priority,
@@ -444,8 +444,8 @@ def prepare_net_g_task(
         feats=feats,
         cache_pitch=cache_pitch,
         cache_pitchf=cache_pitchf,
-        factor=client_context.factor,
-        return_length2=client_context.return_length2,
+        factor=settings.factor,
+        return_length2=settings.return_length2,
     )
     return net_g_task
 
@@ -472,10 +472,14 @@ def phase_vocoder(a, b, fade_out, fade_in):
     )
     return result
 
-# Should be executed sequentially for each PostprocessContext, can be executed in parallel for different contexts
-def postprocess_inference_result(context: PostprocessContext, infered_audio: torch.Tensor, task: NetGTask) -> bytes:
+# Should be executed sequentially for each context, can be executed in parallel for different contexts
+def postprocess_inference_result(
+    settings: SessionSettings,
+    context: PostprocessContext,
+    infered_audio: torch.Tensor,
+) -> bytes:
     t0 = time.perf_counter()
-    upp_res = int(np.floor(task.factor * net_g_tgt_sr // 100))
+    upp_res = int(np.floor(settings.factor * net_g_tgt_sr // 100))
     if upp_res != SAMPLE_RATE // 100:
         with result_resamplers_lock:
             if upp_res not in result_resamplers:
@@ -580,7 +584,7 @@ async def handler(websocket):
     logger.info(f'{log_prefix}Starting voice conversion to {target_voice} transposed by {transpose_by}')
 
     buffer = b''
-    client_context = ClientContext(pitch=transpose_by)
+    settings = SessionSettings(pitch=transpose_by)
     preprocess_blocks_queue: Queue[tuple[bytes, bool]] = Queue()
     intermediate_tasks_queue: Queue[tuple[HubertTask, FcpeTask]] = Queue()
     postprocess_tasks_queue: Queue[NetGTask] = Queue()
@@ -590,7 +594,7 @@ async def handler(websocket):
         async def preprocessing_loop():
             msg_start_ts_ms: Optional[int] = None
             block_num = 0
-            preprocess_context = PreprocessContext()
+            context = PreprocessContext()
             while not stop_event.is_set():
                 try:
                     block, is_last = await asyncio.wait_for(preprocess_blocks_queue.get(), timeout=1)
@@ -605,8 +609,8 @@ async def handler(websocket):
                     hubert_task, fcpe_task = await loop.run_in_executor(
                         executor,
                         prepare_hubert_and_fcpe_tasks,
-                        client_context,
-                        preprocess_context,
+                        settings,
+                        context,
                         block,
                         msg_start_ts_ms + BLOCK_DURATION_MS * block_num,
                         is_last,
@@ -626,7 +630,7 @@ async def handler(websocket):
             logger.info(f'{log_prefix}Preprocessing loop stopped gracefully')
 
         async def intermediate_loop():
-            intermediate_context = IntermediateContext()
+            context = IntermediateContext()
             while not stop_event.is_set():
                 try:
                     hubert_task, fcpe_task = await asyncio.wait_for(intermediate_tasks_queue.get(), timeout=1)
@@ -639,8 +643,8 @@ async def handler(websocket):
                     net_g_task = await loop.run_in_executor(
                         executor,
                         prepare_net_g_task,
-                        client_context,
-                        intermediate_context,
+                        settings,
+                        context,
                         hubert_task.priority,
                         hubert_task.is_last_for_message,
                         fcpe_task.f0_up_key,
@@ -655,22 +659,22 @@ async def handler(websocket):
             logger.info(f'{log_prefix}Intermediate loop stopped gracefully')
 
         async def postprocessing_loop():
-            postprocess_context = PostprocessContext()
+            context = PostprocessContext()
             while not stop_event.is_set():
                 try:
-                    task: NetGTask = await asyncio.wait_for(postprocess_tasks_queue.get(), timeout=1)
-                    result = await task.future
+                    net_g_task = await asyncio.wait_for(postprocess_tasks_queue.get(), timeout=1)
+                    result = await net_g_task.future
 
                     loop = asyncio.get_running_loop()
                     result_audio_block = await loop.run_in_executor(
                         executor,
                         postprocess_inference_result,
-                        postprocess_context,
+                        settings,
+                        context,
                         result,
-                        task,
                     )
                     await websocket.send(result_audio_block)
-                    if task.is_last_for_message:
+                    if net_g_task.is_last_for_message:
                         await websocket.send('end_message')
                 except asyncio.TimeoutError:
                     continue  # periodically checking if we need to stop
