@@ -288,6 +288,7 @@ def create_pitch_and_pitchf(f0: torch.Tensor, f0_up_key: float):
 
 async def hubert_inference_worker():
     while True:
+        t0 = time.perf_counter()
         task1 = await hubert_queue.get()
         tasks_batch = [task1]
         while len(tasks_batch) < MAX_HUBERT_INFERENCE_BATCH_SIZE:
@@ -296,25 +297,36 @@ async def hubert_inference_worker():
                 tasks_batch.append(taskN)
             except asyncio.QueueEmpty:
                 break
+        B = len(tasks_batch)
 
+        t1 = time.perf_counter()
         input_wav_batch = torch.stack([task.input_wav for task in tasks_batch], dim=0)
         if IS_HALF:
             input_wav_batch = input_wav_batch.half()
         else:
             input_wav_batch = input_wav_batch.float()
         padding_mask = torch.BoolTensor(input_wav_batch.shape).to(GPU).fill_(False)
+        t2 = time.perf_counter()
         with torch.no_grad():
             feats_batch, _ = hubert_model.extract_features(
                 source=input_wav_batch,
                 padding_mask=padding_mask,
                 output_layer=12,
             )
-        assert feats_batch.size(0) == len(tasks_batch)
+        assert feats_batch.size(0) == B
+        t3 = time.perf_counter()
         for task, feats in zip(tasks_batch, feats_batch):
             task.future.set_result(feats)
+        t4 = time.perf_counter()
+        print(
+            f'hubert inference [B={B}]: {(t4 - t1) * 1000:.1f} ms [build batch: {(t2 - t1) * 1000:.1f} ms, '
+            f'hubert.extract_features: {(t3 - t2) * 1000:.1f} ms, split res: {(t4 - t3) * 1000:.1f} ms], '
+            f'waited: {(t1 - t0) * 1000:.1f} ms'
+        )
 
 async def fcpe_inference_worker():
     while True:
+        t0 = time.perf_counter()
         task1 = await fcpe_queue.get()
         tasks_batch = [task1]
         while len(tasks_batch) < MAX_FCPE_INFERENCE_BATCH_SIZE:
@@ -323,17 +335,27 @@ async def fcpe_inference_worker():
                 tasks_batch.append(taskN)
             except asyncio.QueueEmpty:
                 break
+        B = len(tasks_batch)
 
+        t1 = time.perf_counter()
         input_wav_batch = torch.stack([task.input_wav for task in tasks_batch], dim=0)
+        t2 = time.perf_counter()
         f0_batch = fcpe_model.infer(
             input_wav_batch.to(GPU).float(),
             sr=16000,
             decoder_mode="local_argmax",
             threshold=0.006,
         )
-        assert f0_batch.size(0) == len(tasks_batch)
+        assert f0_batch.size(0) == B
+        t3 = time.perf_counter()
         for task, f0 in zip(tasks_batch, f0_batch):
             task.future.set_result(f0)
+        t4 = time.perf_counter()
+        print(
+            f'fcpe inference [B={B}]: {(t4 - t1) * 1000:.1f} ms [build batch: {(t2 - t1) * 1000:.1f} ms, '
+            f'fcpe.infer: {(t3 - t2) * 1000:.1f} ms, split res: {(t4 - t3) * 1000:.1f} ms], '
+            f'waited: {(t1 - t0) * 1000:.1f} ms'
+        )
 
 async def net_g_inference_worker(net_g: nn.Module, tasks_queue: PriorityQueue[NetGTask]):
     while True:
@@ -383,7 +405,7 @@ async def net_g_inference_worker(net_g: nn.Module, tasks_queue: PriorityQueue[Ne
             task.future.set_result(infered_audio.float())
         t4 = time.perf_counter()
         print(
-            f'inference: {(t4 - t1) * 1000:.1f} ms [build batch: {(t2 - t1) * 1000:.1f} ms, '
+            f'net_g inference [B={B}]: {(t4 - t1) * 1000:.1f} ms [build batch: {(t2 - t1) * 1000:.1f} ms, '
             f'net_g.infer: {(t3 - t2) * 1000:.1f} ms, split res: {(t4 - t3) * 1000:.1f} ms], '
             f'waited: {(t1 - t0) * 1000:.1f} ms'
         )
@@ -398,6 +420,7 @@ def prepare_hubert_and_fcpe_tasks(
     hubert_future: asyncio.Future,
     fcpe_future: asyncio.Future,
 ) -> tuple[HubertTask, FcpeTask]:
+    t0 = time.perf_counter()
     context.prepare_input_buffers(block_i16=block_i16)
     hubert_task = HubertTask(
         priority=priority,
@@ -414,6 +437,8 @@ def prepare_hubert_and_fcpe_tasks(
         input_wav=context.input_wav_res[-F0_EXTRACTOR_FRAME:].clone(),
         f0_up_key=settings.f0_up_key,
     )
+    t1 = time.perf_counter()
+    print(f'prepare_hubert_and_fcpe_tasks done in {(t1 - t0) * 1000:.1f} ms')
     return hubert_task, fcpe_task
 
 # Should be executed sequentially for each context, can be executed in parallel for different contexts
@@ -426,6 +451,7 @@ def prepare_net_g_task(
     f0: torch.Tensor,
     net_g_future: asyncio.Future,
 ) -> NetGTask:
+    t0 = time.perf_counter()
     feats = feats.unsqueeze(0)
     feats = torch.cat((feats, feats[:, -1:, :]), 1)
     feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
@@ -447,6 +473,8 @@ def prepare_net_g_task(
         factor=settings.factor,
         return_length2=settings.return_length2,
     )
+    t1 = time.perf_counter()
+    print(f'prepare_net_g_task done in {(t1 - t0) * 1000:.1f} ms')
     return net_g_task
 
 def phase_vocoder(a, b, fade_out, fade_in):
