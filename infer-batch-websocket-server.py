@@ -222,15 +222,12 @@ def extract_features(input_wav: torch.Tensor, version="v2"):
         else:
             feats = input_wav.float().view(1, -1)
         padding_mask = torch.BoolTensor(feats.shape).to(GPU).fill_(False)
-        inputs = {
-            "source": feats,
-            "padding_mask": padding_mask,
-            "output_layer": 9 if version == "v1" else 12,
-        }
-        logits = hubert_model.extract_features(**inputs)
-        feats = (
-            hubert_model.final_proj(logits[0]) if version == "v1" else logits[0]
+        logits = hubert_model.extract_features(
+            source=feats,
+            padding_mask=padding_mask,
+            output_layer=9 if version == "v1" else 12,
         )
+        feats = hubert_model.final_proj(logits[0]) if version == "v1" else logits[0]
         feats = torch.cat((feats, feats[:, -1:, :]), 1)
     return feats
 
