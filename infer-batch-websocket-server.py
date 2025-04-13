@@ -278,7 +278,7 @@ def extract_features(input_wav: torch.Tensor):
 
 def create_pitch_and_pitchf(f0: torch.Tensor, f0_up_key: float):
     f0 *= pow(2, f0_up_key / 12)
-    f0 = f0.float().to(GPU)
+    f0 = f0.float().to(GPU).squeeze()
     f0_mel = 1127 * torch.log(1 + f0 / 700)
     f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - F0_MEL_MIN) * 254 / (F0_MEL_MAX - F0_MEL_MIN) + 1
     f0_mel[f0_mel <= 1] = 1
