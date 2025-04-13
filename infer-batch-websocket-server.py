@@ -306,14 +306,19 @@ async def hubert_inference_worker():
         else:
             input_wav_batch = input_wav_batch.float()
         padding_mask = torch.BoolTensor(input_wav_batch.shape).to(GPU).fill_(False)
+
         t2 = time.perf_counter()
-        with torch.no_grad():
-            feats_batch, _ = hubert_model.extract_features(
-                source=input_wav_batch,
-                padding_mask=padding_mask,
-                output_layer=12,
-            )
+        loop = asyncio.get_running_loop()
+        def perform_inference():
+            with torch.no_grad():
+                return hubert_model.extract_features(
+                    source=input_wav_batch,
+                    padding_mask=padding_mask,
+                    output_layer=12,
+                )
+        feats_batch, _ = await loop.run_in_executor(executor, perform_inference)
         assert feats_batch.size(0) == B
+
         t3 = time.perf_counter()
         for task, feats in zip(tasks_batch, feats_batch):
             task.future.set_result(feats)
@@ -339,14 +344,19 @@ async def fcpe_inference_worker():
 
         t1 = time.perf_counter()
         input_wav_batch = torch.stack([task.input_wav for task in tasks_batch], dim=0)
+
         t2 = time.perf_counter()
-        f0_batch = fcpe_model.infer(
-            input_wav_batch.to(GPU).float(),
-            sr=16000,
-            decoder_mode="local_argmax",
-            threshold=0.006,
-        )
+        loop = asyncio.get_running_loop()
+        def perform_inference():
+            return fcpe_model.infer(
+                input_wav_batch.to(GPU).float(),
+                sr=16000,
+                decoder_mode="local_argmax",
+                threshold=0.006,
+            )
+        f0_batch = await loop.run_in_executor(executor, perform_inference)
         assert f0_batch.size(0) == B
+
         t3 = time.perf_counter()
         for task, f0 in zip(tasks_batch, f0_batch):
             task.future.set_result(f0)
@@ -388,18 +398,22 @@ async def net_g_inference_worker(net_g: nn.Module, tasks_queue: PriorityQueue[Ne
         return_length2 = torch.LongTensor([task1.return_length2])
 
         t2 = time.perf_counter()
-        with torch.no_grad():
-            infered_audio_batch, _, _ = net_g.infer(
-                feats,
-                p_len,
-                cache_pitch,
-                cache_pitchf,
-                sid,
-                skip_head,
-                return_length,
-                return_length2,
-            )
+        loop = asyncio.get_running_loop()
+        def perform_inference():
+            with torch.no_grad():
+                return net_g.infer(
+                    feats,
+                    p_len,
+                    cache_pitch,
+                    cache_pitchf,
+                    sid,
+                    skip_head,
+                    return_length,
+                    return_length2,
+                )
+        infered_audio_batch, _, _ = await loop.run_in_executor(executor, perform_inference)
         assert infered_audio_batch.size(0) == B
+
         t3 = time.perf_counter()
         for task, infered_audio in zip(tasks_batch, infered_audio_batch):
             task.future.set_result(infered_audio.float())
