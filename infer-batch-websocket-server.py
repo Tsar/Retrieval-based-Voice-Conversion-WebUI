@@ -258,22 +258,26 @@ def prepare_task_for_inference(
     is_last_for_message: bool,
     future: asyncio.Future,
 ) -> Task:
+    t0 = time.perf_counter()
     context.prepare_input_buffers(block_i16=block_i16)
     input_wav = context.input_wav_res
 
+    t1 = time.perf_counter()
     feats = extract_features(input_wav=input_wav)  # TODO: Use batched inference here if Hubert can
 
+    t2 = time.perf_counter()
     pitch, pitchf = get_f0_fcpe(  # TODO: Use batched inference here if fcpe can
         input_wav=input_wav[-F0_EXTRACTOR_FRAME:],
         f0_up_key=context.pitch - context.formant_shift,
     )
+    t3 = time.perf_counter()
     context.update_pitch_caches(pitch, pitchf)
     cache_pitch = context.cache_pitch[None, -P_LEN:]
     cache_pitchf = context.cache_pitchf[None, -P_LEN:] * context.return_length2 / RETURN_LENGTH
 
     feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
     feats = feats[:, :P_LEN, :]
-    return Task(
+    task = Task(
         priority=priority,
         sequence=next(global_sequence),
         is_last_for_message=is_last_for_message,
@@ -284,9 +288,16 @@ def prepare_task_for_inference(
         return_length2=context.return_length2,
         future=future,
     )
+    t4 = time.perf_counter()
+    print(
+        f'preprocessing: {(t4 - t0) * 1000:.1f} ms [hubert: {(t2 - t1) * 1000:.1f} ms, '
+        f'get_f0_fcpe: {(t3 - t2) * 1000:.1f} ms, other: {(t1 - t0 + t4 - t3) * 1000:.1f} ms]'
+    )
+    return task
 
 async def net_g_inference_worker(net_g: nn.Module, tasks_queue: asyncio.PriorityQueue):
     while True:
+        t0 = time.perf_counter()
         task1: Task = await tasks_queue.get()
         tasks_batch = [task1]
         while len(tasks_batch) < MAX_INFERENCE_BATCH_SIZE:
@@ -304,6 +315,7 @@ async def net_g_inference_worker(net_g: nn.Module, tasks_queue: asyncio.Priority
                 break
         B = len(tasks_batch)
 
+        t1 = time.perf_counter()
         feats = torch.cat([task.feats for task in tasks_batch], dim=0)
         p_len = torch.full((B,), P_LEN, dtype=torch.long, device=GPU)
         cache_pitch = torch.cat([task.cache_pitch for task in tasks_batch], dim=0)
@@ -313,8 +325,7 @@ async def net_g_inference_worker(net_g: nn.Module, tasks_queue: asyncio.Priority
         return_length = torch.LongTensor([RETURN_LENGTH])
         return_length2 = torch.LongTensor([task1.return_length2])
 
-        logger.info(f'Running net_g inference for batch of size {B}')
-        inference_start_ts = time.perf_counter()
+        t2 = time.perf_counter()
         with torch.no_grad():
             infered_audio_batch, _, _ = net_g.infer(
                 feats,
@@ -326,14 +337,16 @@ async def net_g_inference_worker(net_g: nn.Module, tasks_queue: asyncio.Priority
                 return_length,
                 return_length2,
             )
-        inference_end_ts = time.perf_counter()
         assert infered_audio_batch.size(0) == B
-        logger.info(
-            f'Inference result shape is {infered_audio_batch.shape}, '
-            f'obtained in {(inference_end_ts - inference_start_ts) * 1000:.1f} ms'
-        )
+        t3 = time.perf_counter()
         for task, infered_audio in zip(tasks_batch, infered_audio_batch):
             task.future.set_result(infered_audio.float())
+        t4 = time.perf_counter()
+        print(
+            f'inference: {(t4 - t1) * 1000:.1f} ms [build batch: {(t2 - t1) * 1000:.1f} ms, '
+            f'net_g.infer: {(t3 - t2) * 1000:.1f} ms, split res: {(t4 - t3) * 1000:.1f} ms], '
+            f'waited: {(t1 - t0) * 1000:.1f} ms'
+        )
 
 def phase_vocoder(a, b, fade_out, fade_in):
     window = torch.sqrt(fade_out * fade_in)
@@ -360,6 +373,7 @@ def phase_vocoder(a, b, fade_out, fade_in):
 
 # Should be executed sequentially for each context, can be executed in parallel for different contexts
 def postprocess_inference_result(context: PostprocessContext, infered_audio: torch.Tensor, task: Task) -> bytes:
+    t0 = time.perf_counter()
     upp_res = int(np.floor(task.factor * net_g_tgt_sr // 100))
     if upp_res != SAMPLE_RATE // 100:
         with result_resamplers_lock:
@@ -375,6 +389,7 @@ def postprocess_inference_result(context: PostprocessContext, infered_audio: tor
     infer_wav = infered_audio.squeeze()
 
     # SOLA algorithm from https://github.com/yxlllc/DDSP-SVC
+    t1 = time.perf_counter()
     conv_input = infer_wav[None, None, :SOLA_BUFFER_FRAME + SOLA_SEARCH_FRAME]
     cor_nom = F.conv1d(conv_input, context.sola_buffer[None, None, :])
     cor_den = torch.sqrt(F.conv1d(conv_input**2, torch.ones(1, 1, SOLA_BUFFER_FRAME, device=GPU)) + 1e-8)
@@ -388,8 +403,14 @@ def postprocess_inference_result(context: PostprocessContext, infered_audio: tor
     )
     context.sola_buffer[:] = infer_wav[BLOCK_FRAME:BLOCK_FRAME + SOLA_BUFFER_FRAME]
 
+    t2 = time.perf_counter()
     processed_f32 = infer_wav[:BLOCK_FRAME].t().cpu().numpy()
     processed_i16 = (np.clip(processed_f32, -1.0, 1.0 - 1.0 / 32768.0) * 32768.0).astype(np.int16).tobytes()
+    t3 = time.perf_counter()
+    print(
+        f'postprocessing: {(t3 - t0) * 1000:.1f} ms [resample: {(t1 - t0) * 1000:.1f} ms, '
+        f'SOLA: {(t2 - t1) * 1000:.1f} ms, f32->i16: {(t3 - t2) * 1000:.1f} ms]'
+    )
     return processed_i16
 
 def error_message(message, log_prefix='', details_to_log=None):
@@ -547,6 +568,20 @@ async def handler(websocket):
     finally:
         stop_event.set()
 
+async def perform_warmup():
+    block = bytes(BLOCK_SIZE_BYTES)
+    context = PreprocessContext(pitch=4)
+    for _ in range(3):
+        task = prepare_task_for_inference(
+            context=context,
+            block_i16=block,
+            priority=0,
+            is_last_for_message=False,
+            future=asyncio.get_running_loop().create_future(),
+        )
+        inference_queues['voicevox_speaker_43'].put_nowait(task)
+        await task.future
+
 async def main():
     ssl_context = None
     if SSL_CERT and SSL_KEY and os.path.isfile(SSL_CERT) and os.path.isfile(SSL_KEY):
@@ -566,6 +601,7 @@ async def main():
 
     # TODO: Create task for each voice
     asyncio.create_task(net_g_inference_worker(net_g_model, inference_queues['voicevox_speaker_43']))
+    await perform_warmup()
 
     try:
         async with websockets.serve(handler, host='', port=PORT, ssl=ssl_context) as server:
