@@ -201,6 +201,10 @@ class NetGTask(Task):
 global_sequence = itertools.count()
 executor = ThreadPoolExecutor(max_workers=cpu_count() * 2)  # TODO: Replace with ProcessPoolExecutor?
 
+hubert_executor = ThreadPoolExecutor(max_workers=1)
+fcpe_executor = ThreadPoolExecutor(max_workers=1)
+net_g_executor = ThreadPoolExecutor(max_workers=1)
+
 hubert_queue: PriorityQueue[HubertTask] = PriorityQueue()
 fcpe_queue: PriorityQueue[FcpeTask] = PriorityQueue()
 
@@ -316,7 +320,7 @@ async def hubert_inference_worker():
                     padding_mask=padding_mask,
                     output_layer=12,
                 )
-        feats_batch, _ = await loop.run_in_executor(executor, perform_inference)
+        feats_batch, _ = await loop.run_in_executor(hubert_executor, perform_inference)
         assert feats_batch.size(0) == B
 
         t3 = time.perf_counter()
@@ -354,7 +358,7 @@ async def fcpe_inference_worker():
                 decoder_mode="local_argmax",
                 threshold=0.006,
             )
-        f0_batch = await loop.run_in_executor(executor, perform_inference)
+        f0_batch = await loop.run_in_executor(fcpe_executor, perform_inference)
         assert f0_batch.size(0) == B
 
         t3 = time.perf_counter()
@@ -411,7 +415,7 @@ async def net_g_inference_worker(net_g: nn.Module, tasks_queue: PriorityQueue[Ne
                     return_length,
                     return_length2,
                 )
-        infered_audio_batch, _, _ = await loop.run_in_executor(executor, perform_inference)
+        infered_audio_batch, _, _ = await loop.run_in_executor(net_g_executor, perform_inference)
         assert infered_audio_batch.size(0) == B
 
         t3 = time.perf_counter()
