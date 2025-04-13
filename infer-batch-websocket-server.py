@@ -90,22 +90,21 @@ RESAMPLER_TO_16K = tat.Resample(
     dtype=torch.float32,
 ).to(GPU)
 
-class ClientContext:
+FADE_IN_WINDOW: torch.Tensor = (
+    torch.sin(
+        0.5 * np.pi * torch.linspace(0.0, 1.0, steps=SOLA_BUFFER_FRAME, device=GPU, dtype=torch.float32)
+    ) ** 2
+)
+FADE_OUT_WINDOW: torch.Tensor = 1 - FADE_IN_WINDOW
+
+class PreprocessContext:
     def __init__(self, pitch: int, formant_shift: float = 0.0):
         self.pitch = pitch
         self.formant_shift = formant_shift
         self.factor = pow(2, self.formant_shift / 12)
         self.return_length2 = int(np.ceil(RETURN_LENGTH * self.factor))
-        self.input_wav: torch.Tensor = torch.zeros(
-            INPUT_WAV_LEN,
-            device=GPU,
-            dtype=torch.float32,
-        )
-        self.input_wav_res: torch.Tensor = torch.zeros(
-            INPUT_WAV_RES_LEN,
-            device=GPU,
-            dtype=torch.float32,
-        )
+        self.input_wav: torch.Tensor = torch.zeros(INPUT_WAV_LEN, device=GPU, dtype=torch.float32)
+        self.input_wav_res: torch.Tensor = torch.zeros(INPUT_WAV_RES_LEN, device=GPU, dtype=torch.float32)
         self.cache_pitch = torch.zeros(1024, device=GPU, dtype=torch.long)
         self.cache_pitchf = torch.zeros(1024, device=GPU, dtype=torch.float32)
 
@@ -124,6 +123,10 @@ class ClientContext:
         self.cache_pitchf[:-PITCH_SHIFT] = self.cache_pitchf[PITCH_SHIFT:].clone()
         self.cache_pitch[4 - pitch.shape[0]:] = pitch[3:-1]
         self.cache_pitchf[4 - pitch.shape[0]:] = pitchf[3:-1]
+
+class PostprocessContext:
+    def __init__(self):
+        self.sola_buffer: torch.Tensor = torch.zeros(SOLA_BUFFER_FRAME, device=GPU, dtype=torch.float32)
 
 class Task:
     def __init__(
@@ -249,7 +252,7 @@ def get_f0_fcpe(input_wav: torch.Tensor, f0_up_key: float):
 
 # Should be executed sequentially for each context, can be executed in parallel for different contexts
 def prepare_task_for_inference(
-    context: ClientContext,
+    context: PreprocessContext,
     block_i16: bytes,
     priority: int,
     is_last_for_message: bool,
@@ -332,7 +335,31 @@ async def net_g_inference_worker(net_g: nn.Module, tasks_queue: asyncio.Priority
         for task, infered_audio in zip(tasks_batch, infered_audio_batch):
             task.future.set_result(infered_audio.float())
 
-def postprocess_inference_result(infered_audio: torch.Tensor, task: Task) -> bytes:
+def phase_vocoder(a, b, fade_out, fade_in):
+    window = torch.sqrt(fade_out * fade_in)
+    fa = torch.fft.rfft(a * window)
+    fb = torch.fft.rfft(b * window)
+    absab = torch.abs(fa) + torch.abs(fb)
+    n = a.shape[0]
+    if n % 2 == 0:
+        absab[1:-1] *= 2
+    else:
+        absab[1:] *= 2
+    phia = torch.angle(fa)
+    phib = torch.angle(fb)
+    deltaphase = phib - phia
+    deltaphase = deltaphase - 2 * np.pi * torch.floor(deltaphase / 2 / np.pi + 0.5)
+    w = 2 * np.pi * torch.arange(n // 2 + 1).to(a) + deltaphase
+    t = torch.arange(n).unsqueeze(-1).to(a) / n
+    result = (
+        a * (fade_out**2)
+        + b * (fade_in**2)
+        + torch.sum(absab * torch.cos(w * t + phia), -1) * window / n
+    )
+    return result
+
+# Should be executed sequentially for each context, can be executed in parallel for different contexts
+def postprocess_inference_result(context: PostprocessContext, infered_audio: torch.Tensor, task: Task) -> bytes:
     upp_res = int(np.floor(task.factor * net_g_tgt_sr // 100))
     if upp_res != SAMPLE_RATE // 100:
         with result_resamplers_lock:
@@ -347,7 +374,19 @@ def postprocess_inference_result(infered_audio: torch.Tensor, task: Task) -> byt
         infered_audio = resampler(infered_audio[:, :RETURN_LENGTH * upp_res])  # TODO: Move to batch processing?
     infer_wav = infered_audio.squeeze()
 
-    # TODO: SOLA
+    # SOLA algorithm from https://github.com/yxlllc/DDSP-SVC
+    conv_input = infer_wav[None, None, :SOLA_BUFFER_FRAME + SOLA_SEARCH_FRAME]
+    cor_nom = F.conv1d(conv_input, context.sola_buffer[None, None, :])
+    cor_den = torch.sqrt(F.conv1d(conv_input**2, torch.ones(1, 1, SOLA_BUFFER_FRAME, device=GPU)) + 1e-8)
+    sola_offset = torch.argmax(cor_nom[0, 0] / cor_den[0, 0])
+    infer_wav = infer_wav[sola_offset:]
+    infer_wav[:SOLA_BUFFER_FRAME] = phase_vocoder(
+        context.sola_buffer,
+        infer_wav[:SOLA_BUFFER_FRAME],
+        FADE_OUT_WINDOW,
+        FADE_IN_WINDOW,
+    )
+    context.sola_buffer[:] = infer_wav[BLOCK_FRAME:BLOCK_FRAME + SOLA_BUFFER_FRAME]
 
     processed_f32 = infer_wav[:BLOCK_FRAME].t().cpu().numpy()
     processed_i16 = (np.clip(processed_f32, -1.0, 1.0 - 1.0 / 32768.0) * 32768.0).astype(np.int16).tobytes()
@@ -427,7 +466,7 @@ async def handler(websocket):
         async def preprocessing_loop():
             msg_start_ts_ms: Optional[int] = None
             block_num = 0
-            context = ClientContext(pitch=transpose_by)
+            context = PreprocessContext(pitch=transpose_by)
             while not stop_event.is_set():
                 try:
                     block, is_last = await asyncio.wait_for(preprocess_blocks_queue.get(), timeout=1)
@@ -460,6 +499,7 @@ async def handler(websocket):
             logger.info(f'{log_prefix}Preprocessing loop stopped gracefully')
 
         async def postprocessing_loop():
+            context = PostprocessContext()
             while not stop_event.is_set():
                 try:
                     task: Task = await asyncio.wait_for(postprocess_tasks_queue.get(), timeout=1)
@@ -469,6 +509,7 @@ async def handler(websocket):
                     result_audio_block = await loop.run_in_executor(
                         executor,
                         postprocess_inference_result,
+                        context,
                         result,
                         task,
                     )
