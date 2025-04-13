@@ -10,6 +10,7 @@ import logging
 from urllib.parse import urlparse, parse_qs
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 from multiprocessing import cpu_count
 import asyncio
 import websockets
@@ -93,6 +94,8 @@ class ClientContext:
     def __init__(self, pitch: int, formant_shift: float = 0.0):
         self.pitch = pitch
         self.formant_shift = formant_shift
+        self.factor = pow(2, self.formant_shift / 12)
+        self.return_length2 = int(np.ceil(RETURN_LENGTH * self.factor))
         self.input_wav: torch.Tensor = torch.zeros(
             INPUT_WAV_LEN,
             device=GPU,
@@ -127,17 +130,21 @@ class Task:
         self,
         priority: int,
         sequence: int,
+        is_last_for_message: bool,
         feats: torch.Tensor,
         cache_pitch: torch.Tensor,
         cache_pitchf: torch.Tensor,
+        factor: float,
         return_length2: int,
         future: asyncio.Future,
     ):
         self.priority = priority
         self.sequence = sequence
+        self.is_last_for_message = is_last_for_message
         self.feats = feats
         self.cache_pitch = cache_pitch
         self.cache_pitchf = cache_pitchf
+        self.factor = factor
         self.return_length2 = return_length2
         self.future = future
 
@@ -154,9 +161,13 @@ inference_queues = {}
 for voice in SUPPORTED_TARGET_VOICES:
     inference_queues[voice] = asyncio.PriorityQueue()
 
+result_resamplers = {}
+result_resamplers_lock = Lock()
+
 hubert_model: Optional[HubertModel] = None
 fcpe_model: Optional[InferCFNaiveMelPE] = None
 net_g_model: Optional[nn.Module] = None  # TODO: Support multiple net_g models
+net_g_tgt_sr: Optional[int] = None
 
 def load_hubert_model():
     global hubert_model
@@ -185,11 +196,11 @@ def load_fcpe_model():
     logger.info(f'Loaded fcpe model in {(load_done_time - load_start_time) * 1000:.1f} ms')
 
 def load_net_g_model(pth_path):
-    global net_g_model
+    global net_g_model, net_g_tgt_sr
     load_start_time = time.perf_counter()
 
     net_g_model, cpt = get_synthesizer(pth_path=pth_path, device=GPU)
-    tgt_sr = cpt["config"][-1]  # TODO: Use for resampler 2
+    net_g_tgt_sr = cpt["config"][-1]
     cpt["config"][-3] = cpt["weight"]["emb_g.weight"].shape[0]
     assert cpt.get("f0", 1) == 1
     assert cpt.get("version", "v1") == "v2"
@@ -237,7 +248,13 @@ def get_f0_fcpe(input_wav: torch.Tensor, f0_up_key: float):
     return f0_coarse, f0
 
 # Should be executed sequentially for each context, can be executed in parallel for different contexts
-def prepare_task_for_inference(context: ClientContext, block_i16: bytes, priority: int, future: asyncio.Future) -> Task:
+def prepare_task_for_inference(
+    context: ClientContext,
+    block_i16: bytes,
+    priority: int,
+    is_last_for_message: bool,
+    future: asyncio.Future,
+) -> Task:
     context.prepare_input_buffers(block_i16=block_i16)
     input_wav = context.input_wav_res
 
@@ -247,44 +264,55 @@ def prepare_task_for_inference(context: ClientContext, block_i16: bytes, priorit
         input_wav=input_wav[-F0_EXTRACTOR_FRAME:],
         f0_up_key=context.pitch - context.formant_shift,
     )
-    factor = pow(2, context.formant_shift / 12)
-    return_length2 = int(np.ceil(RETURN_LENGTH * factor))
     context.update_pitch_caches(pitch, pitchf)
     cache_pitch = context.cache_pitch[None, -P_LEN:]
-    cache_pitchf = context.cache_pitchf[None, -P_LEN:] * return_length2 / RETURN_LENGTH
+    cache_pitchf = context.cache_pitchf[None, -P_LEN:] * context.return_length2 / RETURN_LENGTH
 
     feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
     feats = feats[:, :P_LEN, :]
     return Task(
         priority=priority,
         sequence=next(global_sequence),
+        is_last_for_message=is_last_for_message,
         feats=feats,
         cache_pitch=cache_pitch,
         cache_pitchf=cache_pitchf,
-        return_length2=return_length2,
+        factor=context.factor,
+        return_length2=context.return_length2,
         future=future,
     )
 
 async def net_g_inference_worker(net_g: nn.Module, tasks_queue: asyncio.PriorityQueue):
     while True:
-        tasks_batch = [await tasks_queue.get()]
-        for _ in range(MAX_INFERENCE_BATCH_SIZE - 1):
+        task1: Task = await tasks_queue.get()
+        tasks_batch = [task1]
+        while len(tasks_batch) < MAX_INFERENCE_BATCH_SIZE:
             try:
-                tasks_batch.append(tasks_queue.get_nowait())
+                taskN: Task = tasks_queue.get_nowait()
+                if taskN.return_length2 != task1.return_length2:
+                    tasks_queue.put_nowait(taskN)  # put it back
+                    logger.warning(
+                        f'Stopped filling inference batch from priority queue at size {len(tasks_batch)} because '
+                        f'next task has different return_length2: {taskN.return_length2} != {task1.return_length2}'
+                    )
+                    break
+                tasks_batch.append(taskN)
             except asyncio.QueueEmpty:
                 break
         B = len(tasks_batch)
+
         feats = torch.cat([task.feats for task in tasks_batch], dim=0)
         p_len = torch.full((B,), P_LEN, dtype=torch.long, device=GPU)
         cache_pitch = torch.cat([task.cache_pitch for task in tasks_batch], dim=0)
         cache_pitchf = torch.cat([task.cache_pitchf for task in tasks_batch], dim=0)
         sid = torch.zeros(B, dtype=torch.long, device=GPU)
-        skip_head = torch.full((B,), SKIP_HEAD, dtype=torch.long)  # TODO: device=GPU??
-        return_length = torch.full((B,), RETURN_LENGTH, dtype=torch.long)  # TODO: device=GPU??
-        return_length2 = torch.tensor([task.return_length2 for task in tasks_batch], dtype=torch.long)  # TODO: device=GPU??
+        skip_head = torch.LongTensor([SKIP_HEAD])
+        return_length = torch.LongTensor([RETURN_LENGTH])
+        return_length2 = torch.LongTensor([task1.return_length2])
 
         logger.info(f'Running net_g inference for batch of size {B}')
-        result = net_g.infer(
+        inference_start_ts = time.perf_counter()
+        infered_audio_batch, _, _ = net_g.infer(
             feats,
             p_len,
             cache_pitch,
@@ -294,7 +322,35 @@ async def net_g_inference_worker(net_g: nn.Module, tasks_queue: asyncio.Priority
             return_length,
             return_length2,
         )
-        # TODO
+        inference_end_ts = time.perf_counter()
+        assert infered_audio_batch.size(0) == B
+        logger.info(
+            f'Inference result shape is {infered_audio_batch.shape}, '
+            f'obtained in {(inference_end_ts - inference_start_ts) * 1000:.1f} ms'
+        )
+        for task, infered_audio in zip(tasks_batch, infered_audio_batch):
+            task.future.set_result(infered_audio.float())
+
+def postprocess_inference_result(infered_audio: torch.Tensor, task: Task) -> bytes:
+    upp_res = int(np.floor(task.factor * net_g_tgt_sr // 100))
+    if upp_res != SAMPLE_RATE // 100:
+        with result_resamplers_lock:
+            if upp_res not in result_resamplers:
+                logger.info(f'Created new resampler: {upp_res * 100} Hz -> {SAMPLE_RATE} Hz')
+                result_resamplers[upp_res] = tat.Resample(
+                    orig_freq=upp_res * 100,
+                    new_freq=SAMPLE_RATE,
+                    dtype=torch.float32,
+                ).to(GPU)
+            resampler = result_resamplers[upp_res]
+        infered_audio = resampler(infered_audio[:, :RETURN_LENGTH * upp_res])  # TODO: Move to batch processing?
+    infer_wav = infered_audio.squeeze()
+
+    # TODO: SOLA
+
+    processed_f32 = infer_wav[:BLOCK_FRAME].t().cpu().numpy()
+    processed_i16 = (np.clip(processed_f32, -1.0, 1.0 - 1.0 / 32768.0) * 32768.0).astype(np.int16).tobytes()
+    return processed_i16
 
 def error_message(message, log_prefix='', details_to_log=None):
     if details_to_log:
@@ -388,6 +444,7 @@ async def handler(websocket):
                         context,
                         block,
                         msg_start_ts_ms + BLOCK_DURATION_MS * block_num,
+                        is_last,
                         loop.create_future(),
                     )
                     postprocess_tasks_queue.put_nowait(task)
@@ -407,8 +464,16 @@ async def handler(websocket):
                     task: Task = await asyncio.wait_for(postprocess_tasks_queue.get(), timeout=1)
                     result = await task.future
 
-                    # TODO
-
+                    loop = asyncio.get_running_loop()
+                    result_audio_block = await loop.run_in_executor(
+                        executor,
+                        postprocess_inference_result,
+                        result,
+                        task,
+                    )
+                    await websocket.send(result_audio_block)
+                    if task.is_last_for_message:
+                        await websocket.send('end_message')
                 except asyncio.TimeoutError:
                     continue  # periodically checking if we need to stop
             logger.info(f'{log_prefix}Postprocessing loop stopped gracefully')
