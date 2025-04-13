@@ -104,7 +104,8 @@ class SessionSettings:
     def __init__(self, pitch: int, formant_shift: float = 0.0):
         self.pitch = pitch
         self.formant_shift = formant_shift
-        self.factor = pow(2, self.formant_shift / 12)
+        self.f0_up_key = pitch - formant_shift
+        self.factor = pow(2, formant_shift / 12)
         self.return_length2 = int(np.ceil(RETURN_LENGTH * self.factor))
 
 class PreprocessContext:
@@ -411,7 +412,7 @@ def prepare_hubert_and_fcpe_tasks(
         is_last_for_message=is_last_for_message,
         future=fcpe_future,
         input_wav=context.input_wav_res[-F0_EXTRACTOR_FRAME:].clone(),
-        f0_up_key=settings.pitch - settings.formant_shift,
+        f0_up_key=settings.f0_up_key,
     )
     return hubert_task, fcpe_task
 
@@ -421,7 +422,6 @@ def prepare_net_g_task(
     context: IntermediateContext,
     priority: int,
     is_last_for_message: bool,
-    f0_up_key: float,
     feats: torch.Tensor,
     f0: torch.Tensor,
     net_g_future: asyncio.Future,
@@ -431,7 +431,7 @@ def prepare_net_g_task(
     feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
     feats = feats[:, :P_LEN, :]
 
-    pitch, pitchf = create_pitch_and_pitchf(f0, f0_up_key)
+    pitch, pitchf = create_pitch_and_pitchf(f0, settings.f0_up_key)
     context.update_pitch_caches(pitch, pitchf)
     cache_pitch = context.cache_pitch[None, -P_LEN:]
     cache_pitchf = context.cache_pitchf[None, -P_LEN:] * settings.return_length2 / RETURN_LENGTH
@@ -647,7 +647,6 @@ async def handler(websocket):
                         context,
                         hubert_task.priority,
                         hubert_task.is_last_for_message,
-                        fcpe_task.f0_up_key,
                         feats,
                         f0,
                         loop.create_future(),
