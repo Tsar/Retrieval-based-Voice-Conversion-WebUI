@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from multiprocessing import cpu_count
 import asyncio
+from asyncio import Queue, PriorityQueue
 import websockets
 import numpy as np
 
@@ -55,7 +56,9 @@ MODEL_PTH_PATH = 'assets/weights/voicevox_speaker_43.pth'
 
 GPU = 'cuda:0'
 IS_HALF = True
-MAX_INFERENCE_BATCH_SIZE = 10
+MAX_HUBERT_INFERENCE_BATCH_SIZE = 10
+MAX_FCPE_INFERENCE_BATCH_SIZE = 10
+MAX_NET_G_INFERENCE_BATCH_SIZE = 10
 
 SAMPLE_RATE = 24000  # for both input and output
 BLOCK_DURATION_MS = 150
@@ -97,16 +100,17 @@ FADE_IN_WINDOW: torch.Tensor = (
 )
 FADE_OUT_WINDOW: torch.Tensor = 1 - FADE_IN_WINDOW
 
-class PreprocessContext:
+class ClientContext:
     def __init__(self, pitch: int, formant_shift: float = 0.0):
         self.pitch = pitch
         self.formant_shift = formant_shift
         self.factor = pow(2, self.formant_shift / 12)
         self.return_length2 = int(np.ceil(RETURN_LENGTH * self.factor))
+
+class PreprocessContext:
+    def __init__(self):
         self.input_wav: torch.Tensor = torch.zeros(INPUT_WAV_LEN, device=GPU, dtype=torch.float32)
         self.input_wav_res: torch.Tensor = torch.zeros(INPUT_WAV_RES_LEN, device=GPU, dtype=torch.float32)
-        self.cache_pitch = torch.zeros(1024, device=GPU, dtype=torch.long)
-        self.cache_pitchf = torch.zeros(1024, device=GPU, dtype=torch.float32)
 
     # TODO: Fill with zeros again on message end?
 
@@ -117,6 +121,11 @@ class PreprocessContext:
         self.input_wav[-BLOCK_FRAME:] = torch.from_numpy(block_f32).to(GPU)
         self.input_wav_res[:-BLOCK_FRAME_16K] = self.input_wav_res[BLOCK_FRAME_16K:].clone()
         self.input_wav_res[-BLOCK_FRAME_16K - 160:] = RESAMPLER_TO_16K(self.input_wav[-BLOCK_FRAME - 2 * ZC:])[160:]
+
+class IntermediateContext:
+    def __init__(self):
+        self.cache_pitch = torch.zeros(1024, device=GPU, dtype=torch.long)
+        self.cache_pitchf = torch.zeros(1024, device=GPU, dtype=torch.float32)
 
     def update_pitch_caches(self, pitch: torch.Tensor, pitchf: torch.Tensor):
         self.cache_pitch[:-PITCH_SHIFT] = self.cache_pitch[PITCH_SHIFT:].clone()
@@ -129,26 +138,10 @@ class PostprocessContext:
         self.sola_buffer: torch.Tensor = torch.zeros(SOLA_BUFFER_FRAME, device=GPU, dtype=torch.float32)
 
 class Task:
-    def __init__(
-        self,
-        priority: int,
-        sequence: int,
-        is_last_for_message: bool,
-        feats: torch.Tensor,
-        cache_pitch: torch.Tensor,
-        cache_pitchf: torch.Tensor,
-        factor: float,
-        return_length2: int,
-        future: asyncio.Future,
-    ):
+    def __init__(self, priority: int, sequence: int, is_last_for_message: bool, future: asyncio.Future):
         self.priority = priority
         self.sequence = sequence
         self.is_last_for_message = is_last_for_message
-        self.feats = feats
-        self.cache_pitch = cache_pitch
-        self.cache_pitchf = cache_pitchf
-        self.factor = factor
-        self.return_length2 = return_length2
         self.future = future
 
     def __lt__(self, other) -> bool:
@@ -156,13 +149,64 @@ class Task:
             return self.priority < other.priority
         return self.sequence < other.sequence
 
+class HubertTask(Task):
+    def __init__(
+        self,
+        priority: int,
+        sequence: int,
+        is_last_for_message: bool,
+        future: asyncio.Future,
+        input_wav: torch.Tensor,
+    ):
+        super().__init__(priority, sequence, is_last_for_message, future)
+        assert input_wav.shape == torch.Size([INPUT_WAV_RES_LEN])
+        self.input_wav = input_wav
+
+class FcpeTask(Task):
+    def __init__(
+        self,
+        priority: int,
+        sequence: int,
+        is_last_for_message: bool,
+        future: asyncio.Future,
+        input_wav: torch.Tensor,
+        f0_up_key: float,
+    ):
+        super().__init__(priority, sequence, is_last_for_message, future)
+        assert input_wav.shape == torch.Size([F0_EXTRACTOR_FRAME])
+        self.input_wav = input_wav
+        self.f0_up_key = f0_up_key
+
+class NetGTask(Task):
+    def __init__(
+        self,
+        priority: int,
+        sequence: int,
+        is_last_for_message: bool,
+        future: asyncio.Future,
+        feats: torch.Tensor,
+        cache_pitch: torch.Tensor,
+        cache_pitchf: torch.Tensor,
+        factor: float,
+        return_length2: int,
+    ):
+        super().__init__(priority, sequence, is_last_for_message, future)
+        self.feats = feats
+        self.cache_pitch = cache_pitch
+        self.cache_pitchf = cache_pitchf
+        self.factor = factor
+        self.return_length2 = return_length2
+
 global_sequence = itertools.count()
 executor = ThreadPoolExecutor(max_workers=cpu_count() * 2)  # TODO: Replace with ProcessPoolExecutor?
 
+hubert_queue: PriorityQueue[HubertTask] = PriorityQueue()
+fcpe_queue: PriorityQueue[FcpeTask] = PriorityQueue()
+
 # Each target voice has its own priority queue
-inference_queues = {}
+inference_queues: dict[str, PriorityQueue[NetGTask]] = {}
 for voice in SUPPORTED_TARGET_VOICES:
-    inference_queues[voice] = asyncio.PriorityQueue()
+    inference_queues[voice] = PriorityQueue()
 
 result_resamplers = {}
 result_resamplers_lock = Lock()
@@ -215,7 +259,7 @@ def load_net_g_model(pth_path):
     load_done_time = time.perf_counter()
     logger.info(f'Loaded net_g model in {(load_done_time - load_start_time) * 1000:.1f} ms')
 
-def extract_features(input_wav: torch.Tensor, version="v2"):
+def extract_features(input_wav: torch.Tensor):
     with torch.no_grad():
         if IS_HALF:
             feats = input_wav.half().view(1, -1)
@@ -225,21 +269,15 @@ def extract_features(input_wav: torch.Tensor, version="v2"):
         logits = hubert_model.extract_features(
             source=feats,
             padding_mask=padding_mask,
-            output_layer=9 if version == "v1" else 12,
+            output_layer=12,
         )
-        feats = hubert_model.final_proj(logits[0]) if version == "v1" else logits[0]
+        feats = logits[0]
         feats = torch.cat((feats, feats[:, -1:, :]), 1)
     return feats
 
-def get_f0_fcpe(input_wav: torch.Tensor, f0_up_key: float):
-    f0 = fcpe_model.infer(
-        input_wav.to(GPU).unsqueeze(0).float(),
-        sr=16000,
-        decoder_mode="local_argmax",
-        threshold=0.006,
-    )
+def create_pitch_and_pitchf(f0: torch.Tensor, f0_up_key: float):
     f0 *= pow(2, f0_up_key / 12)
-    f0 = f0.float().to(GPU).squeeze()
+    f0 = f0.float().to(GPU)
     f0_mel = 1127 * torch.log(1 + f0 / 700)
     f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - F0_MEL_MIN) * 254 / (F0_MEL_MAX - F0_MEL_MIN) + 1
     f0_mel[f0_mel <= 1] = 1
@@ -247,59 +285,63 @@ def get_f0_fcpe(input_wav: torch.Tensor, f0_up_key: float):
     f0_coarse = torch.round(f0_mel).long()
     return f0_coarse, f0
 
-# Should be executed sequentially for each context, can be executed in parallel for different contexts
-def prepare_task_for_inference(
-    context: PreprocessContext,
-    block_i16: bytes,
-    priority: int,
-    is_last_for_message: bool,
-    future: asyncio.Future,
-) -> Task:
-    t0 = time.perf_counter()
-    context.prepare_input_buffers(block_i16=block_i16)
-    input_wav = context.input_wav_res
+async def hubert_inference_worker():
+    while True:
+        task1 = await hubert_queue.get()
+        tasks_batch = [task1]
+        while len(tasks_batch) < MAX_HUBERT_INFERENCE_BATCH_SIZE:
+            try:
+                taskN = hubert_queue.get_nowait()
+                tasks_batch.append(taskN)
+            except asyncio.QueueEmpty:
+                break
 
-    t1 = time.perf_counter()
-    feats = extract_features(input_wav=input_wav)  # TODO: Use batched inference here if Hubert can
+        input_wav_batch = torch.stack([task.input_wav for task in tasks_batch], dim=0)
+        if IS_HALF:
+            input_wav_batch = input_wav_batch.half()
+        else:
+            input_wav_batch = input_wav_batch.float()
+        padding_mask = torch.BoolTensor(input_wav_batch.shape).to(GPU).fill_(False)
+        with torch.no_grad():
+            feats_batch, _ = hubert_model.extract_features(
+                source=input_wav_batch,
+                padding_mask=padding_mask,
+                output_layer=12,
+            )
+        assert feats_batch.size(0) == len(tasks_batch)
+        for task, feats in zip(tasks_batch, feats_batch):
+            task.future.set_result(feats)
 
-    t2 = time.perf_counter()
-    pitch, pitchf = get_f0_fcpe(  # TODO: Use batched inference here if fcpe can
-        input_wav=input_wav[-F0_EXTRACTOR_FRAME:],
-        f0_up_key=context.pitch - context.formant_shift,
-    )
-    t3 = time.perf_counter()
-    context.update_pitch_caches(pitch, pitchf)
-    cache_pitch = context.cache_pitch[None, -P_LEN:]
-    cache_pitchf = context.cache_pitchf[None, -P_LEN:] * context.return_length2 / RETURN_LENGTH
+async def fcpe_inference_worker():
+    while True:
+        task1 = await fcpe_queue.get()
+        tasks_batch = [task1]
+        while len(tasks_batch) < MAX_FCPE_INFERENCE_BATCH_SIZE:
+            try:
+                taskN = fcpe_queue.get_nowait()
+                tasks_batch.append(taskN)
+            except asyncio.QueueEmpty:
+                break
 
-    feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
-    feats = feats[:, :P_LEN, :]
-    task = Task(
-        priority=priority,
-        sequence=next(global_sequence),
-        is_last_for_message=is_last_for_message,
-        feats=feats,
-        cache_pitch=cache_pitch,
-        cache_pitchf=cache_pitchf,
-        factor=context.factor,
-        return_length2=context.return_length2,
-        future=future,
-    )
-    t4 = time.perf_counter()
-    print(
-        f'preprocessing: {(t4 - t0) * 1000:.1f} ms [hubert: {(t2 - t1) * 1000:.1f} ms, '
-        f'get_f0_fcpe: {(t3 - t2) * 1000:.1f} ms, other: {(t1 - t0 + t4 - t3) * 1000:.1f} ms]'
-    )
-    return task
+        input_wav_batch = torch.stack([task.input_wav for task in tasks_batch], dim=0)
+        f0_batch = fcpe_model.infer(
+            input_wav_batch.to(GPU).float(),
+            sr=16000,
+            decoder_mode="local_argmax",
+            threshold=0.006,
+        )
+        assert f0_batch.size(0) == len(tasks_batch)
+        for task, f0 in zip(tasks_batch, f0_batch):
+            task.future.set_result(f0)
 
-async def net_g_inference_worker(net_g: nn.Module, tasks_queue: asyncio.PriorityQueue):
+async def net_g_inference_worker(net_g: nn.Module, tasks_queue: PriorityQueue[NetGTask]):
     while True:
         t0 = time.perf_counter()
-        task1: Task = await tasks_queue.get()
+        task1 = await tasks_queue.get()
         tasks_batch = [task1]
-        while len(tasks_batch) < MAX_INFERENCE_BATCH_SIZE:
+        while len(tasks_batch) < MAX_NET_G_INFERENCE_BATCH_SIZE:
             try:
-                taskN: Task = tasks_queue.get_nowait()
+                taskN = tasks_queue.get_nowait()
                 if taskN.return_length2 != task1.return_length2:
                     tasks_queue.put_nowait(taskN)  # put it back
                     logger.warning(
@@ -345,6 +387,68 @@ async def net_g_inference_worker(net_g: nn.Module, tasks_queue: asyncio.Priority
             f'waited: {(t1 - t0) * 1000:.1f} ms'
         )
 
+# Should be executed sequentially for each PreprocessContext, can be executed in parallel for different contexts
+def prepare_hubert_and_fcpe_tasks(
+    client_context: ClientContext,
+    preprocess_context: PreprocessContext,
+    block_i16: bytes,
+    priority: int,
+    is_last_for_message: bool,
+    hubert_future: asyncio.Future,
+    fcpe_future: asyncio.Future,
+) -> tuple[HubertTask, FcpeTask]:
+    preprocess_context.prepare_input_buffers(block_i16=block_i16)
+    hubert_task = HubertTask(
+        priority=priority,
+        sequence=next(global_sequence),
+        is_last_for_message=is_last_for_message,
+        future=hubert_future,
+        input_wav=preprocess_context.input_wav_res.clone(),
+    )
+    fcpe_task = FcpeTask(
+        priority=priority,
+        sequence=next(global_sequence),
+        is_last_for_message=is_last_for_message,
+        future=fcpe_future,
+        input_wav=preprocess_context.input_wav_res[-F0_EXTRACTOR_FRAME:].clone(),
+        f0_up_key=client_context.pitch - client_context.formant_shift,
+    )
+    return hubert_task, fcpe_task
+
+# Should be executed sequentially for each IntermediateContext, can be executed in parallel for different contexts
+def prepare_net_g_task(
+    client_context: ClientContext,
+    intermediate_context: IntermediateContext,
+    priority: int,
+    is_last_for_message: bool,
+    f0_up_key: float,
+    feats: torch.Tensor,
+    f0: torch.Tensor,
+    net_g_future: asyncio.Future,
+) -> NetGTask:
+    feats = feats.unsqueeze(0)
+    feats = torch.cat((feats, feats[:, -1:, :]), 1)
+    feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
+    feats = feats[:, :P_LEN, :]
+
+    pitch, pitchf = create_pitch_and_pitchf(f0, f0_up_key)
+    intermediate_context.update_pitch_caches(pitch, pitchf)
+    cache_pitch = intermediate_context.cache_pitch[None, -P_LEN:]
+    cache_pitchf = intermediate_context.cache_pitchf[None, -P_LEN:] * client_context.return_length2 / RETURN_LENGTH
+
+    net_g_task = NetGTask(
+        priority=priority,
+        sequence=next(global_sequence),
+        is_last_for_message=is_last_for_message,
+        future=net_g_future,
+        feats=feats,
+        cache_pitch=cache_pitch,
+        cache_pitchf=cache_pitchf,
+        factor=client_context.factor,
+        return_length2=client_context.return_length2,
+    )
+    return net_g_task
+
 def phase_vocoder(a, b, fade_out, fade_in):
     window = torch.sqrt(fade_out * fade_in)
     fa = torch.fft.rfft(a * window)
@@ -368,8 +472,8 @@ def phase_vocoder(a, b, fade_out, fade_in):
     )
     return result
 
-# Should be executed sequentially for each context, can be executed in parallel for different contexts
-def postprocess_inference_result(context: PostprocessContext, infered_audio: torch.Tensor, task: Task) -> bytes:
+# Should be executed sequentially for each PostprocessContext, can be executed in parallel for different contexts
+def postprocess_inference_result(context: PostprocessContext, infered_audio: torch.Tensor, task: NetGTask) -> bytes:
     t0 = time.perf_counter()
     upp_res = int(np.floor(task.factor * net_g_tgt_sr // 100))
     if upp_res != SAMPLE_RATE // 100:
@@ -476,15 +580,17 @@ async def handler(websocket):
     logger.info(f'{log_prefix}Starting voice conversion to {target_voice} transposed by {transpose_by}')
 
     buffer = b''
-    preprocess_blocks_queue = asyncio.Queue()
-    postprocess_tasks_queue = asyncio.Queue()
+    client_context = ClientContext(pitch=transpose_by)
+    preprocess_blocks_queue: Queue[tuple[bytes, bool]] = Queue()
+    intermediate_tasks_queue: Queue[tuple[HubertTask, FcpeTask]] = Queue()
+    postprocess_tasks_queue: Queue[NetGTask] = Queue()
     stop_event = asyncio.Event()
 
     try:
         async def preprocessing_loop():
             msg_start_ts_ms: Optional[int] = None
             block_num = 0
-            context = PreprocessContext(pitch=transpose_by)
+            preprocess_context = PreprocessContext()
             while not stop_event.is_set():
                 try:
                     block, is_last = await asyncio.wait_for(preprocess_blocks_queue.get(), timeout=1)
@@ -496,17 +602,20 @@ async def handler(websocket):
                     assert len(block) == BLOCK_SIZE_BYTES
 
                     loop = asyncio.get_running_loop()
-                    task = await loop.run_in_executor(
+                    hubert_task, fcpe_task = await loop.run_in_executor(
                         executor,
-                        prepare_task_for_inference,
-                        context,
+                        prepare_hubert_and_fcpe_tasks,
+                        client_context,
+                        preprocess_context,
                         block,
                         msg_start_ts_ms + BLOCK_DURATION_MS * block_num,
                         is_last,
                         loop.create_future(),
+                        loop.create_future(),
                     )
-                    postprocess_tasks_queue.put_nowait(task)
-                    inference_queues[target_voice].put_nowait(task)
+                    intermediate_tasks_queue.put_nowait((hubert_task, fcpe_task))
+                    hubert_queue.put_nowait(hubert_task)
+                    fcpe_queue.put_nowait(fcpe_task)
                     block_num += 1
 
                     if is_last:
@@ -516,18 +625,47 @@ async def handler(websocket):
                     continue  # periodically checking if we need to stop
             logger.info(f'{log_prefix}Preprocessing loop stopped gracefully')
 
-        async def postprocessing_loop():
-            context = PostprocessContext()
+        async def intermediate_loop():
+            intermediate_context = IntermediateContext()
             while not stop_event.is_set():
                 try:
-                    task: Task = await asyncio.wait_for(postprocess_tasks_queue.get(), timeout=1)
+                    hubert_task, fcpe_task = await asyncio.wait_for(intermediate_tasks_queue.get(), timeout=1)
+                    assert hubert_task.priority == fcpe_task.priority
+                    assert hubert_task.is_last_for_message == fcpe_task.is_last_for_message
+                    feats = await hubert_task.future
+                    f0 = await fcpe_task.future
+
+                    loop = asyncio.get_running_loop()
+                    net_g_task = await loop.run_in_executor(
+                        executor,
+                        prepare_net_g_task,
+                        client_context,
+                        intermediate_context,
+                        hubert_task.priority,
+                        hubert_task.is_last_for_message,
+                        fcpe_task.f0_up_key,
+                        feats,
+                        f0,
+                        loop.create_future(),
+                    )
+                    postprocess_tasks_queue.put_nowait(net_g_task)
+                    inference_queues[target_voice].put_nowait(net_g_task)
+                except asyncio.TimeoutError:
+                    continue  # periodically checking if we need to stop
+            logger.info(f'{log_prefix}Intermediate loop stopped gracefully')
+
+        async def postprocessing_loop():
+            postprocess_context = PostprocessContext()
+            while not stop_event.is_set():
+                try:
+                    task: NetGTask = await asyncio.wait_for(postprocess_tasks_queue.get(), timeout=1)
                     result = await task.future
 
                     loop = asyncio.get_running_loop()
                     result_audio_block = await loop.run_in_executor(
                         executor,
                         postprocess_inference_result,
-                        context,
+                        postprocess_context,
                         result,
                         task,
                     )
@@ -539,6 +677,7 @@ async def handler(websocket):
             logger.info(f'{log_prefix}Postprocessing loop stopped gracefully')
 
         asyncio.create_task(preprocessing_loop())
+        asyncio.create_task(intermediate_loop())
         asyncio.create_task(postprocessing_loop())
 
         while True:
@@ -567,17 +706,7 @@ async def handler(websocket):
 
 async def perform_warmup():
     block = bytes(BLOCK_SIZE_BYTES)
-    context = PreprocessContext(pitch=4)
-    for _ in range(3):
-        task = prepare_task_for_inference(
-            context=context,
-            block_i16=block,
-            priority=0,
-            is_last_for_message=False,
-            future=asyncio.get_running_loop().create_future(),
-        )
-        inference_queues['voicevox_speaker_43'].put_nowait(task)
-        await task.future
+    # TODO
 
 async def main():
     ssl_context = None
@@ -596,6 +725,8 @@ async def main():
     load_fcpe_model()
     load_net_g_model(pth_path=MODEL_PTH_PATH)  # TODO: Load multiple models
 
+    asyncio.create_task(hubert_inference_worker())
+    asyncio.create_task(fcpe_inference_worker())
     # TODO: Create task for each voice
     asyncio.create_task(net_g_inference_worker(net_g_model, inference_queues['voicevox_speaker_43']))
     await perform_warmup()
