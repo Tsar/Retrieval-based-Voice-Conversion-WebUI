@@ -264,22 +264,6 @@ def load_net_g_model(pth_path):
     load_done_time = time.perf_counter()
     logger.info(f'Loaded net_g model in {(load_done_time - load_start_time) * 1000:.1f} ms')
 
-def extract_features(input_wav: torch.Tensor):
-    with torch.no_grad():
-        if IS_HALF:
-            feats = input_wav.half().view(1, -1)
-        else:
-            feats = input_wav.float().view(1, -1)
-        padding_mask = torch.BoolTensor(feats.shape).to(GPU).fill_(False)
-        logits = hubert_model.extract_features(
-            source=feats,
-            padding_mask=padding_mask,
-            output_layer=12,
-        )
-        feats = logits[0]
-        feats = torch.cat((feats, feats[:, -1:, :]), 1)
-    return feats
-
 def create_pitch_and_pitchf(f0: torch.Tensor, f0_up_key: float):
     f0 *= pow(2, f0_up_key / 12)
     f0 = f0.float().to(GPU).squeeze()
