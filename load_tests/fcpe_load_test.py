@@ -8,6 +8,10 @@ import torch
 from torchfcpe import spawn_bundled_infer_model
 from torchfcpe.models_infer import InferCFNaiveMelPE
 
+from torch.profiler import profile, record_function, ProfilerActivity
+
+USE_PROFILER = True
+
 GPU = 'cuda:0'
 IS_HALF = True
 
@@ -40,7 +44,34 @@ def fcpe_inference():
     assert f0_batch.size(0) == B
     print(f'fcpe inference [B={input_wav_batch.size(0)}]: {(t2 - t1) * 1000:.1f} ms, prep: {(t1 - t0) * 1000:.1f} ms')
 
+def fcpe_inference_with_profiler():
+    t0 = time.perf_counter()
+    # B = random.randint(1, 10)
+    B = 10
+    input_wav_batch = C_input_wav_batch[:B]
+
+    t1 = time.perf_counter()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+        with record_function("fcpe_inference"):
+            f0_batch = fcpe_model.infer(
+                input_wav_batch.to(GPU).float(),
+                sr=16000,
+                decoder_mode="local_argmax",
+                threshold=0.006,
+            )
+    t2 = time.perf_counter()
+    print('Top 10 by self CPU time total')
+    print(prof.key_averages().table(sort_by='self_cpu_time_total', row_limit=10))
+    print('Top 10 by self CUDA time total')
+    print(prof.key_averages().table(sort_by='self_cuda_time_total', row_limit=10))
+    prof.export_chrome_trace("fcpe_trace.json")
+    assert f0_batch.size(0) == B
+    print(f'fcpe inference [B={input_wav_batch.size(0)}]: {(t2 - t1) * 1000:.1f} ms, prep: {(t1 - t0) * 1000:.1f} ms')
+
 if __name__ == '__main__':
     load_fcpe_model()
     while True:
-        fcpe_inference()
+        if USE_PROFILER:
+            fcpe_inference_with_profiler()
+        else:
+            fcpe_inference()

@@ -8,6 +8,10 @@ import torch.nn as nn
 
 from infer.lib.jit.get_synthesizer import get_synthesizer
 
+from torch.profiler import profile, record_function, ProfilerActivity
+
+USE_PROFILER = True
+
 GPU = 'cuda:0'
 IS_HALF = True
 
@@ -72,7 +76,43 @@ def net_g_inference():
     assert infered_audio_batch.size(0) == B
     print(f'net_g inference [B={feats.size(0)}]: {(t2 - t1) * 1000:.1f} ms, prep: {(t1 - t0) * 1000:.1f} ms')
 
+def net_g_inference_with_profiler():
+    t0 = time.perf_counter()
+    # B = random.randint(1, 10)
+    B = 10
+    feats = C_feats[:B]
+    p_len = C_p_len[:B]
+    cache_pitch = C_cache_pitch[:B]
+    cache_pitchf = C_cache_pitchf[:B]
+    sid = C_sid[:B]
+
+    t1 = time.perf_counter()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+        with record_function("net_g_inference"):
+            with torch.no_grad():
+                infered_audio_batch, _, _ = net_g_model.infer(
+                    feats,
+                    p_len,
+                    cache_pitch,
+                    cache_pitchf,
+                    sid,
+                    skip_head,
+                    return_length,
+                    return_length2,
+                )
+    t2 = time.perf_counter()
+    print('Top 10 by self CPU time total')
+    print(prof.key_averages().table(sort_by='self_cpu_time_total', row_limit=10))
+    print('Top 10 by self CUDA time total')
+    print(prof.key_averages().table(sort_by='self_cuda_time_total', row_limit=10))
+    prof.export_chrome_trace("net_g_trace.json")
+    assert infered_audio_batch.size(0) == B
+    print(f'net_g inference [B={feats.size(0)}]: {(t2 - t1) * 1000:.1f} ms, prep: {(t1 - t0) * 1000:.1f} ms')
+
 if __name__ == '__main__':
     load_net_g_model('../assets/weights/voicevox_speaker_43.pth')
     while True:
-        net_g_inference()
+        if USE_PROFILER:
+            net_g_inference_with_profiler()
+        else:
+            net_g_inference()

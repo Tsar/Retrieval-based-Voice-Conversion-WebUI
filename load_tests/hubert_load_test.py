@@ -8,6 +8,10 @@ import fairseq.checkpoint_utils
 from fairseq.models.hubert import HubertModel
 import torch
 
+from torch.profiler import profile, record_function, ProfilerActivity
+
+USE_PROFILER = True
+
 GPU = 'cuda:0'
 IS_HALF = True
 
@@ -55,7 +59,35 @@ def hubert_inference():
     assert feats_batch.size(0) == B
     print(f'hubert inference [B={input_wav_batch.size(0)}]: {(t2 - t1) * 1000:.1f} ms, prep: {(t1 - t0) * 1000:.1f} ms')
 
+def hubert_inference_with_profiler():
+    t0 = time.perf_counter()
+    # B = random.randint(1, 10)
+    B = 10
+    input_wav_batch = C_input_wav_batch[:B]
+    padding_mask = C_padding_mask[:B]
+
+    t1 = time.perf_counter()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+        with record_function("hubert_inference"):
+            with torch.no_grad():
+                feats_batch, _ = hubert_model.extract_features(
+                    source=input_wav_batch,
+                    padding_mask=padding_mask,
+                    output_layer=12,
+                )
+    t2 = time.perf_counter()
+    print('Top 10 by self CPU time total')
+    print(prof.key_averages().table(sort_by='self_cpu_time_total', row_limit=10))
+    print('Top 10 by self CUDA time total')
+    print(prof.key_averages().table(sort_by='self_cuda_time_total', row_limit=10))
+    prof.export_chrome_trace("hubert_trace.json")
+    assert feats_batch.size(0) == B
+    print(f'hubert inference [B={input_wav_batch.size(0)}]: {(t2 - t1) * 1000:.1f} ms, prep: {(t1 - t0) * 1000:.1f} ms')
+
 if __name__ == '__main__':
     load_hubert_model()
     while True:
-        hubert_inference()
+        if USE_PROFILER:
+            hubert_inference_with_profiler()
+        else:
+            hubert_inference()
