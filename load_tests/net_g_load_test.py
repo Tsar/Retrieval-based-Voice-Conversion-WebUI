@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 
+import os
+import sys
 import time
+import random
 from typing import Optional
 
 import torch
 import torch.nn as nn
 
-from infer.lib.jit.get_synthesizer import get_synthesizer
-
 from torch.profiler import profile, record_function, ProfilerActivity
 
-USE_PROFILER = True
+root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, root)
+from infer.lib.jit.get_synthesizer import get_synthesizer
+
+USE_PROFILER = bool(int(os.environ.get('USE_PROFILER', 0)))
+RAND_BATCH_SIZE = bool(int(os.environ.get('RAND_BATCH_SIZE', 0)))
 
 GPU = 'cuda:0'
 IS_HALF = True
@@ -52,8 +58,10 @@ return_length2 = torch.LongTensor([RETURN_LENGTH2])
 
 def net_g_inference():
     t0 = time.perf_counter()
-    # B = random.randint(1, 10)
-    B = 10
+    if RAND_BATCH_SIZE:
+        B = random.randint(1, 10)
+    else:
+        B = 10
     feats = C_feats[:B]
     p_len = C_p_len[:B]
     cache_pitch = C_cache_pitch[:B]
@@ -78,8 +86,10 @@ def net_g_inference():
 
 def net_g_inference_with_profiler():
     t0 = time.perf_counter()
-    # B = random.randint(1, 10)
-    B = 10
+    if RAND_BATCH_SIZE:
+        B = random.randint(1, 10)
+    else:
+        B = 10
     feats = C_feats[:B]
     p_len = C_p_len[:B]
     cache_pitch = C_cache_pitch[:B]

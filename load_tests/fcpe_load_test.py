@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import os
 import time
 import random
 from typing import Optional
@@ -10,7 +11,8 @@ from torchfcpe.models_infer import InferCFNaiveMelPE
 
 from torch.profiler import profile, record_function, ProfilerActivity
 
-USE_PROFILER = True
+USE_PROFILER = bool(int(os.environ.get('USE_PROFILER', 0)))
+RAND_BATCH_SIZE = bool(int(os.environ.get('RAND_BATCH_SIZE', 0)))
 
 GPU = 'cuda:0'
 IS_HALF = True
@@ -29,8 +31,10 @@ assert C_input_wav_batch.shape == torch.Size([10, 3200])
 
 def fcpe_inference():
     t0 = time.perf_counter()
-    # B = random.randint(1, 10)
-    B = 10
+    if RAND_BATCH_SIZE:
+        B = random.randint(1, 10)
+    else:
+        B = 10
     input_wav_batch = C_input_wav_batch[:B]
 
     t1 = time.perf_counter()
@@ -46,8 +50,10 @@ def fcpe_inference():
 
 def fcpe_inference_with_profiler():
     t0 = time.perf_counter()
-    # B = random.randint(1, 10)
-    B = 10
+    if RAND_BATCH_SIZE:
+        B = random.randint(1, 10)
+    else:
+        B = 10
     input_wav_batch = C_input_wav_batch[:B]
 
     t1 = time.perf_counter()
