@@ -29,7 +29,7 @@ C_cache_pitch = torch.load('../data/cache_pitch.pt')
 C_cache_pitchf = torch.load('../data/cache_pitchf.pt')
 C_sid = torch.zeros(10, dtype=torch.long)
 
-async def net_g_inference(no_verify_ssl_connector):
+async def net_g_inference(session):
     t0 = time.perf_counter()
     if RAND_BATCH_SIZE:
         B = random.randint(1, 10)
@@ -96,12 +96,11 @@ async def net_g_inference(no_verify_ssl_connector):
     }
 
     t1 = time.perf_counter()
-    async with aiohttp.ClientSession(connector=no_verify_ssl_connector) as session:
-        async with session.post(URL, json=request) as resp:
-            if resp.status != 200:
-                print(f'Request failed with code {resp.status}: {await resp.text()}')
-                return
-            result = await resp.json()
+    async with session.post(URL, json=request) as resp:
+        if resp.status != 200:
+            print(f'Request failed with code {resp.status}: {await resp.text()}')
+            return
+        result = await resp.json()
     t2 = time.perf_counter()
     print(result)
     #assert infered_audio_batch.size(0) == B
@@ -113,8 +112,9 @@ async def main():
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
     no_verify_ssl_connector = aiohttp.TCPConnector(ssl=ssl_context)
-    while True:
-        await net_g_inference(no_verify_ssl_connector)
+    async with aiohttp.ClientSession(connector=no_verify_ssl_connector) as session:
+        while True:
+            await net_g_inference(session)
 
 if __name__ == '__main__':
     asyncio.run(main())
