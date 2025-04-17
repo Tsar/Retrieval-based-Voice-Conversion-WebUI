@@ -46,13 +46,27 @@ INPUT_VOICES_PITCH = {
     'sage': 5,
 }
 
-TARGET_VOICES_PITCH = {
-    'voicevox_speaker_43': 8,
+class TargetVoice:
+    def __init__(self, model_pth_path: str, pitch: int, formant_shift: float = 0.0):
+        self.pitch = pitch
+        self.model_pth_path = model_pth_path
+        self.formant_shift = formant_shift
+
+TARGET_VOICES: dict[str, TargetVoice] = {
+    'voicevox_speaker_43': TargetVoice(
+        model_pth_path='assets/weights/voicevox_speaker_43.pth',
+        pitch=8,
+    ),
+    'xiangling_eng': TargetVoice(
+        model_pth_path='assets/weights/xiangling_eng_30_epochs_with_pitch.pth',
+        pitch=12,
+        formant_shift=1.0,
+    ),
+    'citlali_jap': TargetVoice(
+        model_pth_path='assets/weights/citlali_jap.pth',
+        pitch=6,
+    ),
 }
-
-SUPPORTED_TARGET_VOICES = list(TARGET_VOICES_PITCH.keys())
-
-MODEL_PTH_PATH = 'assets/weights/voicevox_speaker_43.pth'
 
 GPU = 'cuda:0'
 IS_HALF = True
@@ -101,7 +115,8 @@ FADE_IN_WINDOW: torch.Tensor = (
 FADE_OUT_WINDOW: torch.Tensor = 1 - FADE_IN_WINDOW
 
 class SessionSettings:
-    def __init__(self, pitch: int, formant_shift: float = 0.0):
+    def __init__(self, target_voice: str, pitch: int, formant_shift: float):
+        self.target_voice = target_voice
         self.pitch = pitch
         self.formant_shift = formant_shift
         self.f0_up_key = pitch - formant_shift
@@ -207,19 +222,15 @@ net_g_executor = ThreadPoolExecutor(max_workers=1)
 
 hubert_queue: PriorityQueue[HubertTask] = PriorityQueue()
 fcpe_queue: PriorityQueue[FcpeTask] = PriorityQueue()
-
-# Each target voice has its own priority queue
-inference_queues: dict[str, PriorityQueue[NetGTask]] = {}
-for voice in SUPPORTED_TARGET_VOICES:
-    inference_queues[voice] = PriorityQueue()
+inference_queues: dict[str, PriorityQueue[NetGTask]] = {}  # Each target voice has its own priority queue
 
 result_resamplers = {}
 result_resamplers_lock = Lock()
 
 hubert_model: Optional[HubertModel] = None
 fcpe_model: Optional[InferCFNaiveMelPE] = None
-net_g_model: Optional[nn.Module] = None  # TODO: Support multiple net_g models
-net_g_tgt_sr: Optional[int] = None
+net_g_models: dict[str, nn.Module] = {}
+net_g_models_tgt_sr: dict[str, int] = {}
 
 def load_hubert_model():
     global hubert_model
@@ -247,8 +258,7 @@ def load_fcpe_model():
     load_done_time = time.perf_counter()
     logger.info(f'Loaded fcpe model in {(load_done_time - load_start_time) * 1000:.1f} ms')
 
-def load_net_g_model(pth_path):
-    global net_g_model, net_g_tgt_sr
+def load_net_g_model(pth_path: str) -> tuple[nn.Module, int]:
     load_start_time = time.perf_counter()
 
     net_g_model, cpt = get_synthesizer(pth_path=pth_path, device=GPU)
@@ -263,6 +273,7 @@ def load_net_g_model(pth_path):
 
     load_done_time = time.perf_counter()
     logger.info(f'Loaded net_g model in {(load_done_time - load_start_time) * 1000:.1f} ms')
+    return net_g_model, net_g_tgt_sr
 
 def create_pitch_and_pitchf(f0: torch.Tensor, f0_up_key: float):
     f0 *= pow(2, f0_up_key / 12)
@@ -509,6 +520,7 @@ def postprocess_inference_result(
     infered_audio: torch.Tensor,
 ) -> bytes:
     t0 = time.perf_counter()
+    net_g_tgt_sr = net_g_models_tgt_sr[settings.target_voice]
     upp_res = int(np.floor(settings.factor * net_g_tgt_sr // 100))
     if upp_res != SAMPLE_RATE // 100:
         with result_resamplers_lock:
@@ -582,9 +594,9 @@ async def handler(websocket):
         await websocket.send(error_message('No target_voice in query params', log_prefix=log_prefix, details_to_log=params))
         return
     target_voice = params['target_voice'][0]
-    if target_voice not in TARGET_VOICES_PITCH:
+    if target_voice not in TARGET_VOICES:
         await websocket.send(error_message(
-            f'Unsupported target_voice, only the following are supported: {list(TARGET_VOICES_PITCH.keys())}',
+            f'Unsupported target_voice, only the following are supported: {list(TARGET_VOICES.keys())}',
             log_prefix=log_prefix,
             details_to_log=params,
         ))
@@ -606,7 +618,7 @@ async def handler(websocket):
                 details_to_log=params,
             ))
             return
-        transpose_by = TARGET_VOICES_PITCH[target_voice] - INPUT_VOICES_PITCH[input_voice]
+        transpose_by = TARGET_VOICES[target_voice].pitch - INPUT_VOICES_PITCH[input_voice]
     else:
         await websocket.send(error_message('No transpose_by or input_voice in query params', log_prefix=log_prefix, details_to_log=params))
         return
@@ -614,7 +626,11 @@ async def handler(websocket):
     logger.info(f'{log_prefix}Starting voice conversion to {target_voice} transposed by {transpose_by}')
 
     buffer = b''
-    settings = SessionSettings(pitch=transpose_by)
+    settings = SessionSettings(
+        target_voice=target_voice,
+        pitch=transpose_by,
+        formant_shift=TARGET_VOICES[target_voice].formant_shift,
+    )
     preprocess_blocks_queue: Queue[tuple[bytes, bool]] = Queue()
     intermediate_tasks_queue: Queue[tuple[HubertTask, FcpeTask]] = Queue()
     postprocess_tasks_queue: Queue[NetGTask] = Queue()
@@ -756,12 +772,17 @@ async def main():
 
     load_hubert_model()
     load_fcpe_model()
-    load_net_g_model(pth_path=MODEL_PTH_PATH)  # TODO: Load multiple models
+    for voice in TARGET_VOICES:
+        model, tgt_sr = load_net_g_model(pth_path=TARGET_VOICES[voice].model_pth_path)
+        net_g_models[voice] = model
+        net_g_models_tgt_sr[voice] = tgt_sr
 
     asyncio.create_task(hubert_inference_worker())
     asyncio.create_task(fcpe_inference_worker())
-    # TODO: Create task for each voice
-    asyncio.create_task(net_g_inference_worker(net_g_model, inference_queues['voicevox_speaker_43']))
+    for voice in net_g_models:
+        inference_queues[voice] = PriorityQueue()
+        asyncio.create_task(net_g_inference_worker(net_g_models[voice], inference_queues[voice]))
+
     await perform_warmup()
 
     try:

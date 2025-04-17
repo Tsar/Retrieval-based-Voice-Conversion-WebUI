@@ -18,8 +18,8 @@ AUTH_TOKEN = os.environ['AUTH_TOKEN']
 PORT = int(os.environ.get('PORT', 7411))
 
 INPUT_VOICE = 'sage'
-TARGET_VOICE = 'voicevox_speaker_43'
-URL = f'ws://localhost:{PORT}/v1/voice_conversion?input_voice={INPUT_VOICE}&target_voice={TARGET_VOICE}'
+DEFAULT_TARGET_VOICE = 'voicevox_speaker_43'
+URL_PREFIX = f'ws://localhost:{PORT}/v1/voice_conversion?input_voice={INPUT_VOICE}&target_voice='
 
 TEST_DATA_DIR = 'websocket-test-client-data'
 
@@ -55,14 +55,15 @@ def read_audio_files_parts():
     print()
     return audio_map2
 
-async def run_test_client(client_num, audio_key, audio_parts, output_filename):
+async def run_test_client(client_num, target_voice, audio_key, audio_parts, output_filename):
+    url = URL_PREFIX + target_voice
     log_prefix = f'[client {client_num:02d}] '
     first_part_sent_ts = None
     first_part_received_ts = None
     end_message_received_ts = None
     received_total = 0
 
-    async with websockets.connect(URL, additional_headers={'Authorization': BEARER_PREFIX + AUTH_TOKEN}) as websocket:
+    async with websockets.connect(url, additional_headers={'Authorization': BEARER_PREFIX + AUTH_TOKEN}) as websocket:
         async def receiver():
             nonlocal first_part_received_ts, end_message_received_ts, received_total
             buffer = b''
@@ -115,21 +116,23 @@ async def run_test_client(client_num, audio_key, audio_parts, output_filename):
         ]
         print(log_prefix + f'\n{log_prefix}'.join(result))
 
-async def try_run_test_client(client_num, audio_key, audio_parts, output_filename):
+async def try_run_test_client(client_num, target_voice, audio_key, audio_parts, output_filename):
     try:
-        await run_test_client(client_num, audio_key, audio_parts, output_filename)
+        await run_test_client(client_num, target_voice, audio_key, audio_parts, output_filename)
     except Exception as ex:
         print(f'CLIENT {client_num:02d} DIED WITH EXCEPTION: {ex}')
 
 async def main():
+    usage_message = f'Usage: {sys.argv[0]} <number_of_parallel_clients> [<target_voice>]'
     if len(sys.argv) < 2:
-        print(f'Usage: {sys.argv[0]} <number_of_parallel_clients>')
+        print(usage_message)
         return 1
     try:
         clients_count = int(sys.argv[1])
     except ValueError:
-        print(f'Usage: {sys.argv[0]} <number_of_parallel_clients>')
+        print(usage_message)
         return 1
+    target_voice = sys.argv[2] if len(sys.argv) >= 3 else DEFAULT_TARGET_VOICE
 
     audio_files_parts = read_audio_files_parts()
 
@@ -139,6 +142,7 @@ async def main():
 
     tasks = [try_run_test_client(
         client_num=i,
+        target_voice=target_voice,
         audio_key=audio_key,
         audio_parts=audio_files_parts[audio_key],
         output_filename=f'{TEST_DATA_DIR}/output_{i:02d}.wav'
