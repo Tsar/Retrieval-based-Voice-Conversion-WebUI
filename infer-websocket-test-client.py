@@ -26,6 +26,10 @@ URL_PREFIX = f'{SCHEMA}://{HOST}:{PORT}/v1/voice_conversion?input_voice={INPUT_V
 
 TEST_DATA_DIR = 'websocket-test-client-data'
 
+COLOR_RED = '\033[31m'
+COLOR_GREEN = '\033[32m'
+COLOR_RESET = '\033[0m'
+
 ts = lambda: datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
 
 def save_to_wav(log_prefix, filename, audio_data, sample_rate=24000, subtype='PCM_16'):
@@ -81,9 +85,10 @@ async def run_test_client(client_num, target_voice, audio_key, audio_parts, outp
                         if first_part_received_ts is None:
                             first_part_received_ts = recv_ts
                         delta_with_realtime = len(buffer) / 24000 / 2 - (recv_ts - first_part_received_ts)
+                        delta_color = COLOR_GREEN if delta_with_realtime >= 0 else COLOR_RED
                         print(
-                            f'[{ts()}]{log_prefix}Received data {data_num} of size {len(data)},'
-                            f'delta with realtime = {delta_with_realtime * 1000:+.1f} ms'
+                            f'[{ts()}]{log_prefix}Received data {data_num} of size {len(data)}, '
+                            f'delta with realtime = {delta_color}{delta_with_realtime * 1000:+.1f} ms{COLOR_RESET}'
                         )
                         buffer += data
                         data_num += 1
@@ -114,6 +119,8 @@ async def run_test_client(client_num, target_voice, audio_key, audio_parts, outp
 
         receiving_elapsed = end_message_received_ts - first_part_received_ts
         received_audio_duration = received_total / 24000 / 2
+        x_faster_than_realtime = received_audio_duration / receiving_elapsed
+        res_color = COLOR_GREEN if x_faster_than_realtime >= 1.0 else COLOR_RED
         result = [
             f'============= {log_prefix}REPORT =============',
             f'Delay from first part sent till first part received: {(first_part_received_ts - first_part_sent_ts) * 1000:.2f} ms',
@@ -121,7 +128,7 @@ async def run_test_client(client_num, target_voice, audio_key, audio_parts, outp
             f'Receiving all parts took: {receiving_elapsed * 1000:.1f} ms',
             f'Original audio duration: {sent_total / 24000 / 2:.3f} s',
             f'Received audio duration: {received_audio_duration:.3f} s',
-            f'Receiving was {received_audio_duration / receiving_elapsed:.2f} times faster than realtime',
+            f'Receiving was {res_color}{x_faster_than_realtime:.2f}{COLOR_RESET} times faster than realtime',
             f'==============================================',
         ]
         print(log_prefix + f'\n{log_prefix}'.join(result))
