@@ -6,6 +6,7 @@ import re
 import random
 import itertools
 import time
+from datetime import datetime
 import asyncio
 import websockets
 import numpy as np
@@ -15,13 +16,17 @@ BEARER_PREFIX = 'Bearer '
 
 AUTH_TOKEN = os.environ['AUTH_TOKEN']
 
+SCHEMA = os.environ.get('SCHEMA', 'ws')
+HOST = os.environ.get('HOST', 'localhost')
 PORT = int(os.environ.get('PORT', 7411))
 
 INPUT_VOICE = 'sage'
 DEFAULT_TARGET_VOICE = 'voicevox_speaker_43'
-URL_PREFIX = f'ws://localhost:{PORT}/v1/voice_conversion?input_voice={INPUT_VOICE}&target_voice='
+URL_PREFIX = f'{SCHEMA}://{HOST}:{PORT}/v1/voice_conversion?input_voice={INPUT_VOICE}&target_voice='
 
 TEST_DATA_DIR = 'websocket-test-client-data'
+
+ts = lambda: datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
 
 def save_to_wav(log_prefix, filename, audio_data, sample_rate=24000, subtype='PCM_16'):
     soundfile.write(filename, np.frombuffer(audio_data, dtype=np.int16), sample_rate, subtype=subtype)
@@ -72,15 +77,20 @@ async def run_test_client(client_num, target_voice, audio_key, audio_parts, outp
                 try:
                     data = await asyncio.wait_for(websocket.recv(), timeout=1)
                     if isinstance(data, bytes):
+                        recv_ts = time.time()
                         if first_part_received_ts is None:
-                            first_part_received_ts = time.time()
-                        print(f'{log_prefix}Received data {data_num} of size {len(data)}')
+                            first_part_received_ts = recv_ts
+                        delta_with_realtime = recv_ts - first_part_received_ts - len(buffer) / 24000 / 2
+                        print(
+                            f'[{ts()}]{log_prefix}Received data {data_num} of size {len(data)},'
+                            f'delta with realtime = {delta_with_realtime * 1000:+.1f} ms'
+                        )
                         buffer += data
                         data_num += 1
                     elif isinstance(data, str):
                         if data == 'end_message':
                             end_message_received_ts = time.time()
-                            print(f'{log_prefix}Received end_message')
+                            print(f'[{ts()}]{log_prefix}Received end_message')
                             break
                 except asyncio.TimeoutError:
                     continue  # periodically checking if we need to stop
@@ -91,7 +101,7 @@ async def run_test_client(client_num, target_voice, audio_key, audio_parts, outp
         receive_task = asyncio.create_task(receiver())
         sent_total = 0
         for i, audio_part in enumerate(audio_parts, start=1):
-            print(f'{log_prefix}Sending "{audio_key}", part {i}, size {len(audio_part)}')
+            print(f'[{ts()}]{log_prefix}Sending "{audio_key}", part {i}, size {len(audio_part)}')
             await websocket.send(audio_part)
             sent_total += len(audio_part)
             if first_part_sent_ts is None:
@@ -107,8 +117,8 @@ async def run_test_client(client_num, target_voice, audio_key, audio_parts, outp
         result = [
             f'============= {log_prefix}REPORT =============',
             f'Delay from first part sent till first part received: {(first_part_received_ts - first_part_sent_ts) * 1000:.2f} ms',
-            f'Sending all parts took: {(end_message_sent_ts - first_part_sent_ts) * 1000:.2f} ms',
-            f'Receiving all parts took: {receiving_elapsed * 1000:.2f} ms',
+            f'Sending all parts took: {(end_message_sent_ts - first_part_sent_ts) * 1000:.1f} ms',
+            f'Receiving all parts took: {receiving_elapsed * 1000:.1f} ms',
             f'Original audio duration: {sent_total / 24000 / 2:.3f} s',
             f'Received audio duration: {received_audio_duration:.3f} s',
             f'Receiving was {received_audio_duration / receiving_elapsed:.2f} times faster than realtime',
