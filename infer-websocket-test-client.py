@@ -80,7 +80,7 @@ async def run_test_client(client_num, target_voice, audio_key, audio_parts, outp
                         recv_ts = time.time()
                         if first_part_received_ts is None:
                             first_part_received_ts = recv_ts
-                        delta_with_realtime = recv_ts - first_part_received_ts - len(buffer) / 24000 / 2
+                        delta_with_realtime = len(buffer) / 24000 / 2 - (recv_ts - first_part_received_ts)
                         print(
                             f'[{ts()}]{log_prefix}Received data {data_num} of size {len(data)},'
                             f'delta with realtime = {delta_with_realtime * 1000:+.1f} ms'
