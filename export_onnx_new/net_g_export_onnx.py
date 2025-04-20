@@ -113,6 +113,7 @@ def export_to_onnx(onnx_filename):
             'pitch': {0: 'batch_size', 1: 'p_len'},
             'pitchf': {0: 'batch_size', 1: 'p_len'},
             'sid': {0: 'batch_size'},
+            'audio': {0: 'batch_size', 1: 'audio_len'},
         },
         opset_version=17,
         export_params=True,
