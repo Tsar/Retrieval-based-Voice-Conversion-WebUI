@@ -16,7 +16,7 @@ from infer.lib.jit.get_synthesizer import get_synthesizer
 DATA_DIR = '../load_tests/data'
 
 GPU = 'cuda:0'
-IS_HALF = True
+IS_HALF = False
 
 P_LEN = 224
 SKIP_HEAD = 200
@@ -42,10 +42,10 @@ def load_net_g_model(pth_path):
     load_done_time = time.perf_counter()
     print(f'Loaded net_g model in {(load_done_time - load_start_time) * 1000:.1f} ms')
 
-C_feats = torch.load(f'{DATA_DIR}/feats.pt').to(GPU)
+C_feats = torch.load(f'{DATA_DIR}/feats.pt').float().to(GPU)
 C_p_len = torch.full((10,), P_LEN, dtype=torch.long, device=GPU)
 C_cache_pitch = torch.load(f'{DATA_DIR}/cache_pitch.pt').to(GPU)
-C_cache_pitchf = torch.load(f'{DATA_DIR}/cache_pitchf.pt').to(GPU)
+C_cache_pitchf = torch.load(f'{DATA_DIR}/cache_pitchf.pt').float().to(GPU)
 C_sid = torch.zeros(10, dtype=torch.long, device=GPU)
 
 C_skip_head = torch.LongTensor([SKIP_HEAD])
@@ -156,11 +156,11 @@ if __name__ == '__main__':
 
         load_net_g_model(f'../{voice_props.model_pth_path}')
         export_to_onnx(
-            onnx_filename=f'{voice}.onnx',
+            onnx_filename=f'{voice}_fp32.onnx',
             return_length2=ret_length2_tensor,
         )
         export_to_onnx(
-            onnx_filename=f'{voice}__no_dynamic_shapes.onnx',
+            onnx_filename=f'{voice}__no_dynamic_shapes_fp32.onnx',
             return_length2=ret_length2_tensor,
             use_dynamic_axes=False,
         )
