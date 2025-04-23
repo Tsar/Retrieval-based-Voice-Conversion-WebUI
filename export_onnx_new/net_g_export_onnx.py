@@ -4,6 +4,7 @@ import os
 import sys
 import time
 from typing import Optional
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -20,7 +21,6 @@ IS_HALF = True
 P_LEN = 224
 SKIP_HEAD = 200
 RETURN_LENGTH = 20
-RETURN_LENGTH2 = 20
 
 net_g_model: Optional[nn.Module] = None
 
@@ -50,7 +50,6 @@ C_sid = torch.zeros(10, dtype=torch.long, device=GPU)
 
 C_skip_head = torch.LongTensor([SKIP_HEAD])
 C_return_length = torch.LongTensor([RETURN_LENGTH])
-C_return_length2 = torch.LongTensor([RETURN_LENGTH2])
 
 class NetGWrapper(nn.Module):
     def __init__(self, orig_net_g_model: nn.Module):
@@ -79,12 +78,17 @@ class NetGWrapper(nn.Module):
             return_length2,
         )[0]
 
-def export_to_onnx(onnx_filename):
+def export_to_onnx(onnx_filename, return_length2: torch.LongTensor, use_scripting=False):
     model = NetGWrapper(orig_net_g_model=net_g_model)
     model.eval()
 
+    to_export = model
+    if use_scripting:
+        scripted_model = torch.jit.script(model)
+        to_export = scripted_model
+
     torch.onnx.export(
-        model,
+        to_export,
         (
             C_feats,
             C_p_len,
@@ -93,7 +97,7 @@ def export_to_onnx(onnx_filename):
             C_sid,
             C_skip_head,
             C_return_length,
-            C_return_length2,
+            return_length2,
         ),
         onnx_filename,
         input_names=[
@@ -118,10 +122,39 @@ def export_to_onnx(onnx_filename):
         opset_version=17,
         export_params=True,
         do_constant_folding=True,
-        dynamo=True,
-        external_data=False,
+        use_external_data_format=False,
     )
 
+class Voice:
+    def __init__(self, model_pth_path: str, pitch: int, formant_shift: float = 0.0):
+        self.pitch = pitch
+        self.model_pth_path = model_pth_path
+        self.formant_shift = formant_shift
+
+VOICES: dict[str, Voice] = {
+    'voicevox_speaker_43': Voice(
+        model_pth_path='assets/weights/voicevox_speaker_43.pth',
+        pitch=8,
+    ),
+    'xiangling_eng': Voice(
+        model_pth_path='assets/weights/xiangling_eng_30_epochs_with_pitch.pth',
+        pitch=12,
+        formant_shift=1.0,
+    ),
+    'citlali_jap': Voice(
+        model_pth_path='assets/weights/citlali_jap.pth',
+        pitch=6,
+    ),
+}
+
 if __name__ == '__main__':
-    load_net_g_model('../assets/weights/voicevox_speaker_43.pth')
-    export_to_onnx('voicevox_speaker_43.onnx')
+    for voice in VOICES:
+        voice_props = VOICES[voice]
+        factor = pow(2, voice_props.formant_shift / 12)
+        ret_length2 = int(np.ceil(RETURN_LENGTH * factor))
+
+        load_net_g_model(f'../{voice_props.model_pth_path}')
+        export_to_onnx(
+            onnx_filename=f'{voice}.onnx',
+            return_length2=torch.LongTensor([ret_length2]),
+        )

@@ -55,8 +55,10 @@ def export_to_onnx():
     model = HubertExtractFeaturesWrapper(orig_hubert_model=hubert_model)
     model.eval()
 
+    scripted_model = torch.jit.script(model)
+
     torch.onnx.export(
-        model,
+        scripted_model,
         (
             C_input_wav_batch,  # source
             C_padding_mask,     # padding_mask
@@ -72,7 +74,7 @@ def export_to_onnx():
         opset_version=17,
         export_params=True,
         do_constant_folding=True,
-        dynamo=True,
+        use_external_data_format=False,
     )
 
 if __name__ == '__main__':

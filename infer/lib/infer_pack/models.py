@@ -350,7 +350,7 @@ class SineGen(torch.nn.Module):
             uv = uv.float()
         return uv
     
-    def _f02sine(self, f0, upp):
+    def _f02sine(self, f0, upp: int):
         """ f0: (batchsize, length, dim)
             where dim indicates fundamental tone and overtones
         """

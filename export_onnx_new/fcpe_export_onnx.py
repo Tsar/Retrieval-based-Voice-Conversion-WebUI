@@ -42,8 +42,10 @@ def export_to_onnx():
     model = FcpeWrapper(orig_fcpe_model=fcpe_model)
     model.eval()
 
+    scripted_model = torch.jit.script(model)
+
     torch.onnx.export(
-        model,
+        scripted_model,
         (C_input_wav_batch,),
         'fcpe.onnx',
         input_names=['input_wav'],
@@ -55,8 +57,7 @@ def export_to_onnx():
         opset_version=17,
         export_params=True,
         do_constant_folding=True,
-        dynamo=True,
-        external_data=False,
+        use_external_data_format=False,
     )
 
 if __name__ == '__main__':
