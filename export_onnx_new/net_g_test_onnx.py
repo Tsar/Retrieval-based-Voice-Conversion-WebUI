@@ -23,11 +23,10 @@ C_sid = torch.zeros(10, dtype=torch.long, device=GPU)
 C_skip_head = torch.LongTensor([SKIP_HEAD])
 C_return_length = torch.LongTensor([RETURN_LENGTH])
 
-class Voice:
-    def __init__(self, model_pth_path: str, pitch: int, formant_shift: float = 0.0):
-        self.pitch = pitch
-        self.model_pth_path = model_pth_path
-        self.formant_shift = formant_shift
+fp32_opt_suffix = '' if IS_HALF else '_fp32'
+if not IS_HALF:
+    C_feats = C_feats.float()
+    C_cache_pitchf = C_cache_pitchf.float()
 
 VOICES = {
     'voicevox_speaker_43',
@@ -36,8 +35,9 @@ VOICES = {
 }
 
 if __name__ == '__main__':
+    onnxruntime.preload_dlls()
     for voice in VOICES:
-        session = onnxruntime.InferenceSession(f'{voice}.onnx', providers=['CUDAExecutionProvider'])
+        session = onnxruntime.InferenceSession(f'{voice}{fp32_opt_suffix}.onnx', providers=['CUDAExecutionProvider'])
         #for input_arg in session.get_inputs():
         #    print(f'Input: {input_arg}')
         for _ in range(5):
