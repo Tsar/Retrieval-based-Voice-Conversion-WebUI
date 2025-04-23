@@ -78,7 +78,7 @@ class NetGWrapper(nn.Module):
             return_length2,
         )[0]
 
-def export_to_onnx(onnx_filename, return_length2: torch.LongTensor, use_scripting=False):
+def export_to_onnx(onnx_filename, return_length2: torch.LongTensor, use_scripting=False, use_dynamic_axes=True):
     model = NetGWrapper(orig_net_g_model=net_g_model)
     model.eval()
 
@@ -118,7 +118,7 @@ def export_to_onnx(onnx_filename, return_length2: torch.LongTensor, use_scriptin
             'pitchf': {0: 'batch_size', 1: 'p_len'},
             'sid': {0: 'batch_size'},
             'audio': {0: 'batch_size', 1: 'audio_len'},
-        },
+        } if use_dynamic_axes else None,
         opset_version=17,
         export_params=True,
         do_constant_folding=True,
@@ -152,9 +152,15 @@ if __name__ == '__main__':
         voice_props = VOICES[voice]
         factor = pow(2, voice_props.formant_shift / 12)
         ret_length2 = int(np.ceil(RETURN_LENGTH * factor))
+        ret_length2_tensor = torch.LongTensor([ret_length2])
 
         load_net_g_model(f'../{voice_props.model_pth_path}')
         export_to_onnx(
             onnx_filename=f'{voice}.onnx',
-            return_length2=torch.LongTensor([ret_length2]),
+            return_length2=ret_length2_tensor,
+        )
+        export_to_onnx(
+            onnx_filename=f'{voice}__no_dynamic_shapes.onnx',
+            return_length2=ret_length2_tensor,
+            use_dynamic_axes=False,
         )
