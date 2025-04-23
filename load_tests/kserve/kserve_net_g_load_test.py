@@ -11,6 +11,8 @@ import aiohttp
 
 import torch
 
+from aiohttp_trace import request_tracer
+
 BEARER_PREFIX = 'Bearer '
 
 AUTH_TOKEN = os.environ['AUTH_TOKEN']
@@ -118,7 +120,10 @@ async def net_g_inference(session):
     print(f'net_g inference [B={B}]: {(t2 - t1) * 1000:.1f} ms, prep: {(t1 - t0) * 1000:.1f} ms, post: {(t3 - t2) * 1000:.1f} ms')
 
 async def main():
-    async with aiohttp.ClientSession(headers={'Authorization': BEARER_PREFIX + AUTH_TOKEN}) as session:
+    async with aiohttp.ClientSession(
+        headers={'Authorization': BEARER_PREFIX + AUTH_TOKEN},
+        trace_configs=[request_tracer()],
+    ) as session:
         while True:
             await net_g_inference(session)
 
