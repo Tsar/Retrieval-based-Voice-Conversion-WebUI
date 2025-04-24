@@ -148,8 +148,7 @@ VOICES: dict[str, Voice] = {
 }
 
 if __name__ == '__main__':
-    for voice in VOICES:
-        voice_props = VOICES[voice]
+    for voice, voice_props in VOICES.items():
         factor = pow(2, voice_props.formant_shift / 12)
         ret_length2 = int(np.ceil(RETURN_LENGTH * factor))
         ret_length2_tensor = torch.LongTensor([ret_length2])

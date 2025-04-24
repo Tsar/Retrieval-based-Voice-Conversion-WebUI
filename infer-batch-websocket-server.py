@@ -9,6 +9,7 @@ import itertools
 import logging
 from urllib.parse import urlparse, parse_qs
 from typing import Optional
+from enum import Enum
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from multiprocessing import cpu_count
@@ -28,6 +29,8 @@ from torchfcpe.models_infer import InferCFNaiveMelPE
 
 from infer.lib.jit.get_synthesizer import get_synthesizer
 
+import onnxruntime  # required only for ONNX mode
+
 logger = logging.getLogger('infer-batch-websocket-server')
 
 BEARER_PREFIX = 'Bearer '
@@ -40,6 +43,12 @@ SSL_CERT = os.environ.get('SSL_CERT_FILENAME')
 SSL_KEY  = os.environ.get('SSL_KEY_FILENAME')
 ALLOW_UNENCRYPTED_SERVING = int(os.environ.get('ALLOW_UNENCRYPTED_SERVING', 0))
 
+class Mode(str, Enum):
+    PYTORCH = 'PYTORCH'
+    ONNX    = 'ONNX'
+
+MODE = os.environ.get('MODE', Mode.PYTORCH)
+
 INPUT_VOICES_PITCH = {
     'coral': 4,
     'shimmer': 0,
@@ -47,26 +56,32 @@ INPUT_VOICES_PITCH = {
 }
 
 class TargetVoice:
-    def __init__(self, model_pth_path: str, pitch: int, formant_shift: float = 0.0):
+    def __init__(self, model_pth_path: str, model_onnx_path: str, pitch: int, formant_shift: float = 0.0):
+        self.model_pth_path = model_pth_path    # required only for Pytorch mode
+        self.model_onnx_path = model_onnx_path  # required only for ONNX mode
         self.pitch = pitch
-        self.model_pth_path = model_pth_path
         self.formant_shift = formant_shift
 
 TARGET_VOICES: dict[str, TargetVoice] = {
     'voicevox_speaker_43': TargetVoice(
         model_pth_path='assets/weights/voicevox_speaker_43.pth',
+        model_onnx_path='export_onnx_new/voicevox_speaker_43.onnx',
         pitch=8,
     ),
     'xiangling_eng': TargetVoice(
         model_pth_path='assets/weights/xiangling_eng_30_epochs_with_pitch.pth',
+        model_onnx_path='export_onnx_new/xiangling_eng.onnx',
         pitch=12,
         formant_shift=1.0,
     ),
     'citlali_jap': TargetVoice(
         model_pth_path='assets/weights/citlali_jap.pth',
+        model_onnx_path='export_onnx_new/citlali_jap.onnx',
         pitch=6,
     ),
 }
+
+ONNX_OUTPUT_SAMPLE_RATE = 40000
 
 GPU = 'cuda:0'
 IS_HALF = True
@@ -229,7 +244,7 @@ result_resamplers_lock = Lock()
 
 hubert_model: Optional[HubertModel] = None
 fcpe_model: Optional[InferCFNaiveMelPE] = None
-net_g_models: dict[str, nn.Module] = {}
+net_g_models: dict[str, nn.Module | onnxruntime.InferenceSession] = {}
 net_g_models_tgt_sr: dict[str, int] = {}
 
 def load_hubert_model():
@@ -275,6 +290,13 @@ def load_net_g_model(pth_path: str) -> tuple[nn.Module, int]:
     logger.info(f'Loaded net_g model in {(load_done_time - load_start_time) * 1000:.1f} ms')
     return net_g_model, net_g_tgt_sr
 
+def load_onnx_net_g_model(onnx_path: str) -> tuple[onnxruntime.InferenceSession, int]:
+    load_start_time = time.perf_counter()
+    session = onnxruntime.InferenceSession(onnx_path, providers=['CUDAExecutionProvider'])
+    load_done_time = time.perf_counter()
+    logger.info(f'Loaded ONNX net_g model in {(load_done_time - load_start_time) * 1000:.1f} ms')
+    return session, ONNX_OUTPUT_SAMPLE_RATE
+
 def create_pitch_and_pitchf(f0: torch.Tensor, f0_up_key: float):
     f0 *= pow(2, f0_up_key / 12)
     f0 = f0.float().to(GPU).squeeze()
@@ -287,141 +309,183 @@ def create_pitch_and_pitchf(f0: torch.Tensor, f0_up_key: float):
 
 async def hubert_inference_worker():
     while True:
-        t0 = time.perf_counter()
-        task1 = await hubert_queue.get()
-        tasks_batch = [task1]
-        while len(tasks_batch) < MAX_HUBERT_INFERENCE_BATCH_SIZE:
-            try:
-                taskN = hubert_queue.get_nowait()
-                tasks_batch.append(taskN)
-            except asyncio.QueueEmpty:
-                break
-        B = len(tasks_batch)
+        try:
+            t0 = time.perf_counter()
+            task1 = await hubert_queue.get()
+            tasks_batch = [task1]
+            while len(tasks_batch) < MAX_HUBERT_INFERENCE_BATCH_SIZE:
+                try:
+                    taskN = hubert_queue.get_nowait()
+                    tasks_batch.append(taskN)
+                except asyncio.QueueEmpty:
+                    break
+            B = len(tasks_batch)
 
-        t1 = time.perf_counter()
-        input_wav_batch = torch.stack([task.input_wav for task in tasks_batch], dim=0)
-        if IS_HALF:
-            input_wav_batch = input_wav_batch.half()
-        else:
-            input_wav_batch = input_wav_batch.float()
-        padding_mask = torch.BoolTensor(input_wav_batch.shape).to(GPU).fill_(False)
+            t1 = time.perf_counter()
+            input_wav_batch = torch.stack([task.input_wav for task in tasks_batch], dim=0)
+            if IS_HALF:
+                input_wav_batch = input_wav_batch.half()
+            else:
+                input_wav_batch = input_wav_batch.float()
+            padding_mask = torch.BoolTensor(input_wav_batch.shape).to(GPU).fill_(False)
 
-        t2 = time.perf_counter()
-        loop = asyncio.get_running_loop()
-        def perform_inference():
-            with torch.no_grad():
-                return hubert_model.extract_features(
-                    source=input_wav_batch,
-                    padding_mask=padding_mask,
-                    output_layer=12,
-                )
-        feats_batch, _ = await loop.run_in_executor(hubert_executor, perform_inference)
-        assert feats_batch.size(0) == B
+            t2 = time.perf_counter()
+            loop = asyncio.get_running_loop()
+            def perform_inference():
+                with torch.no_grad():
+                    return hubert_model.extract_features(
+                        source=input_wav_batch,
+                        padding_mask=padding_mask,
+                        output_layer=12,
+                    )
+            feats_batch, _ = await loop.run_in_executor(hubert_executor, perform_inference)
+            assert feats_batch.size(0) == B
 
-        t3 = time.perf_counter()
-        for task, feats in zip(tasks_batch, feats_batch):
-            task.future.set_result(feats)
-        t4 = time.perf_counter()
-        print(
-            f'hubert inference [B={B}]: {(t4 - t1) * 1000:.1f} ms [build batch: {(t2 - t1) * 1000:.1f} ms, '
-            f'hubert.extract_features: {(t3 - t2) * 1000:.1f} ms, split res: {(t4 - t3) * 1000:.1f} ms], '
-            f'waited: {(t1 - t0) * 1000:.1f} ms'
-        )
+            t3 = time.perf_counter()
+            for task, feats in zip(tasks_batch, feats_batch):
+                task.future.set_result(feats)
+            t4 = time.perf_counter()
+            print(
+                f'hubert inference [B={B}]: {(t4 - t1) * 1000:.1f} ms [build batch: {(t2 - t1) * 1000:.1f} ms, '
+                f'hubert.extract_features: {(t3 - t2) * 1000:.1f} ms, split res: {(t4 - t3) * 1000:.1f} ms], '
+                f'waited: {(t1 - t0) * 1000:.1f} ms'
+            )
+        except Exception as ex:
+            logger.error(f'hubert inference cycle step failed: {ex}')
+            # TODO: Fail tasks which were taken from the queue
 
 async def fcpe_inference_worker():
     while True:
-        t0 = time.perf_counter()
-        task1 = await fcpe_queue.get()
-        tasks_batch = [task1]
-        while len(tasks_batch) < MAX_FCPE_INFERENCE_BATCH_SIZE:
-            try:
-                taskN = fcpe_queue.get_nowait()
-                tasks_batch.append(taskN)
-            except asyncio.QueueEmpty:
-                break
-        B = len(tasks_batch)
-
-        t1 = time.perf_counter()
-        input_wav_batch = torch.stack([task.input_wav for task in tasks_batch], dim=0)
-
-        t2 = time.perf_counter()
-        loop = asyncio.get_running_loop()
-        def perform_inference():
-            return fcpe_model.infer(
-                input_wav_batch.to(GPU).float(),
-                sr=16000,
-                decoder_mode="local_argmax",
-                threshold=0.006,
-            )
-        f0_batch = await loop.run_in_executor(fcpe_executor, perform_inference)
-        assert f0_batch.size(0) == B
-
-        t3 = time.perf_counter()
-        for task, f0 in zip(tasks_batch, f0_batch):
-            task.future.set_result(f0)
-        t4 = time.perf_counter()
-        print(
-            f'fcpe inference [B={B}]: {(t4 - t1) * 1000:.1f} ms [build batch: {(t2 - t1) * 1000:.1f} ms, '
-            f'fcpe.infer: {(t3 - t2) * 1000:.1f} ms, split res: {(t4 - t3) * 1000:.1f} ms], '
-            f'waited: {(t1 - t0) * 1000:.1f} ms'
-        )
-
-async def net_g_inference_worker(net_g: nn.Module, tasks_queue: PriorityQueue[NetGTask]):
-    while True:
-        t0 = time.perf_counter()
-        task1 = await tasks_queue.get()
-        tasks_batch = [task1]
-        while len(tasks_batch) < MAX_NET_G_INFERENCE_BATCH_SIZE:
-            try:
-                taskN = tasks_queue.get_nowait()
-                if taskN.return_length2 != task1.return_length2:
-                    tasks_queue.put_nowait(taskN)  # put it back
-                    logger.warning(
-                        f'Stopped filling inference batch from priority queue at size {len(tasks_batch)} because '
-                        f'next task has different return_length2: {taskN.return_length2} != {task1.return_length2}'
-                    )
+        try:
+            t0 = time.perf_counter()
+            task1 = await fcpe_queue.get()
+            tasks_batch = [task1]
+            while len(tasks_batch) < MAX_FCPE_INFERENCE_BATCH_SIZE:
+                try:
+                    taskN = fcpe_queue.get_nowait()
+                    tasks_batch.append(taskN)
+                except asyncio.QueueEmpty:
                     break
-                tasks_batch.append(taskN)
-            except asyncio.QueueEmpty:
-                break
-        B = len(tasks_batch)
+            B = len(tasks_batch)
 
-        t1 = time.perf_counter()
-        feats = torch.cat([task.feats for task in tasks_batch], dim=0)
-        p_len = torch.full((B,), P_LEN, dtype=torch.long, device=GPU)
-        cache_pitch = torch.cat([task.cache_pitch for task in tasks_batch], dim=0)
-        cache_pitchf = torch.cat([task.cache_pitchf for task in tasks_batch], dim=0)
-        sid = torch.zeros(B, dtype=torch.long, device=GPU)
-        skip_head = torch.LongTensor([SKIP_HEAD])
-        return_length = torch.LongTensor([RETURN_LENGTH])
-        return_length2 = torch.LongTensor([task1.return_length2])
+            t1 = time.perf_counter()
+            input_wav_batch = torch.stack([task.input_wav for task in tasks_batch], dim=0)
 
-        t2 = time.perf_counter()
-        loop = asyncio.get_running_loop()
-        def perform_inference():
-            with torch.no_grad():
-                return net_g.infer(
-                    feats,
-                    p_len,
-                    cache_pitch,
-                    cache_pitchf,
-                    sid,
-                    skip_head,
-                    return_length,
-                    return_length2,
+            t2 = time.perf_counter()
+            loop = asyncio.get_running_loop()
+            def perform_inference():
+                return fcpe_model.infer(
+                    input_wav_batch.to(GPU).float(),
+                    sr=16000,
+                    decoder_mode="local_argmax",
+                    threshold=0.006,
                 )
-        infered_audio_batch, _, _ = await loop.run_in_executor(net_g_executor, perform_inference)
-        assert infered_audio_batch.size(0) == B
+            f0_batch = await loop.run_in_executor(fcpe_executor, perform_inference)
+            assert f0_batch.size(0) == B
 
-        t3 = time.perf_counter()
-        for task, infered_audio in zip(tasks_batch, infered_audio_batch):
-            task.future.set_result(infered_audio.float())
-        t4 = time.perf_counter()
-        print(
-            f'net_g inference [B={B}]: {(t4 - t1) * 1000:.1f} ms [build batch: {(t2 - t1) * 1000:.1f} ms, '
-            f'net_g.infer: {(t3 - t2) * 1000:.1f} ms, split res: {(t4 - t3) * 1000:.1f} ms], '
-            f'waited: {(t1 - t0) * 1000:.1f} ms'
-        )
+            t3 = time.perf_counter()
+            for task, f0 in zip(tasks_batch, f0_batch):
+                task.future.set_result(f0)
+            t4 = time.perf_counter()
+            print(
+                f'fcpe inference [B={B}]: {(t4 - t1) * 1000:.1f} ms [build batch: {(t2 - t1) * 1000:.1f} ms, '
+                f'fcpe.infer: {(t3 - t2) * 1000:.1f} ms, split res: {(t4 - t3) * 1000:.1f} ms], '
+                f'waited: {(t1 - t0) * 1000:.1f} ms'
+            )
+        except Exception as ex:
+            logger.error(f'fcpe inference cycle step failed: {ex}')
+            # TODO: Fail tasks which were taken from the queue
+
+async def net_g_inference_worker(net_g: nn.Module | onnxruntime.InferenceSession, tasks_queue: PriorityQueue[NetGTask]):
+    while True:
+        try:
+            t0 = time.perf_counter()
+            task1 = await tasks_queue.get()
+            tasks_batch = [task1]
+            while len(tasks_batch) < MAX_NET_G_INFERENCE_BATCH_SIZE:
+                try:
+                    taskN = tasks_queue.get_nowait()
+                    if taskN.return_length2 != task1.return_length2:
+                        tasks_queue.put_nowait(taskN)  # put it back
+                        logger.warning(
+                            f'Stopped filling inference batch from priority queue at size {len(tasks_batch)} because '
+                            f'next task has different return_length2: {taskN.return_length2} != {task1.return_length2}'
+                        )
+                        break
+                    tasks_batch.append(taskN)
+                except asyncio.QueueEmpty:
+                    break
+            B = len(tasks_batch)
+
+            t1 = time.perf_counter()
+            feats = torch.cat([task.feats for task in tasks_batch], dim=0)
+            p_len = torch.full((B,), P_LEN, dtype=torch.long, device=GPU)
+            cache_pitch = torch.cat([task.cache_pitch for task in tasks_batch], dim=0)
+            cache_pitchf = torch.cat([task.cache_pitchf for task in tasks_batch], dim=0)
+            sid = torch.zeros(B, dtype=torch.long, device=GPU)
+            skip_head = torch.LongTensor([SKIP_HEAD])
+            return_length = torch.LongTensor([RETURN_LENGTH])
+            return_length2 = torch.LongTensor([task1.return_length2])
+
+            if MODE == Mode.ONNX:
+                feats = feats.numpy(force=True)
+                p_len = p_len.numpy(force=True)
+                cache_pitch = cache_pitch.numpy(force=True)
+                cache_pitchf = cache_pitchf.numpy(force=True)
+                sid = sid.numpy(force=True)
+
+            t2 = time.perf_counter()
+            loop = asyncio.get_running_loop()
+            if MODE == Mode.PYTORCH:
+                assert isinstance(net_g, nn.Module)
+                def perform_inference():
+                    with torch.no_grad():
+                        return net_g.infer(
+                            feats,
+                            p_len,
+                            cache_pitch,
+                            cache_pitchf,
+                            sid,
+                            skip_head,
+                            return_length,
+                            return_length2,
+                        )
+                infered_audio_batch, _, _ = await loop.run_in_executor(net_g_executor, perform_inference)
+            elif MODE == Mode.ONNX:
+                assert isinstance(net_g, onnxruntime.InferenceSession)
+                def perform_onnx_inference():
+                    outputs = net_g.run(
+                        output_names=None,
+                        input_feed={
+                            'feats': feats,
+                            'p_len': p_len,
+                            'pitch': cache_pitch,
+                            'pitchf': cache_pitchf,
+                            'sid': sid,
+                        }
+                    )
+                    assert len(outputs) == 1  # ONNX returns only audio
+                    return outputs[0]
+                infered_audio_batch = await loop.run_in_executor(net_g_executor, perform_onnx_inference)
+            else:
+                raise RuntimeError(f'Invalid mode: {MODE}')
+
+            t3 = time.perf_counter()
+            if MODE == Mode.ONNX:
+                infered_audio_batch = torch.from_numpy(infered_audio_batch).to(GPU)
+
+            assert infered_audio_batch.size(0) == B
+            for task, infered_audio in zip(tasks_batch, infered_audio_batch):
+                task.future.set_result(infered_audio.float())
+            t4 = time.perf_counter()
+            print(
+                f'net_g inference [B={B}]: {(t4 - t1) * 1000:.1f} ms [build batch: {(t2 - t1) * 1000:.1f} ms, '
+                f'net_g.infer: {(t3 - t2) * 1000:.1f} ms, split res: {(t4 - t3) * 1000:.1f} ms], '
+                f'waited: {(t1 - t0) * 1000:.1f} ms'
+            )
+        except Exception as ex:
+            logger.error(f'net_g inference cycle step failed: {ex}')
+            # TODO: Fail tasks which were taken from the queue
 
 # Should be executed sequentially for each context, can be executed in parallel for different contexts
 def prepare_hubert_and_fcpe_tasks(
@@ -673,6 +737,8 @@ async def handler(websocket):
                         block_num = 0
                 except asyncio.TimeoutError:
                     continue  # periodically checking if we need to stop
+                except Exception as exc:
+                    logger.error(f'Preprocessing loop cycle step failed: {exc}')
             logger.info(f'{log_prefix}Preprocessing loop stopped gracefully')
 
         async def intermediate_loop():
@@ -701,6 +767,8 @@ async def handler(websocket):
                     inference_queues[target_voice].put_nowait(net_g_task)
                 except asyncio.TimeoutError:
                     continue  # periodically checking if we need to stop
+                except Exception as exc:
+                    logger.error(f'Intermediate loop cycle step failed: {exc}')
             logger.info(f'{log_prefix}Intermediate loop stopped gracefully')
 
         async def postprocessing_loop():
@@ -723,6 +791,8 @@ async def handler(websocket):
                         await websocket.send('end_message')
                 except asyncio.TimeoutError:
                     continue  # periodically checking if we need to stop
+                except Exception as exc:
+                    logger.error(f'Postprocessing loop cycle step failed: {exc}')
             logger.info(f'{log_prefix}Postprocessing loop stopped gracefully')
 
         asyncio.create_task(preprocessing_loop())
@@ -758,6 +828,9 @@ async def perform_warmup():
     # TODO
 
 async def main():
+    if MODE == Mode.ONNX:
+        onnxruntime.preload_dlls()
+
     ssl_context = None
     if SSL_CERT and SSL_KEY and os.path.isfile(SSL_CERT) and os.path.isfile(SSL_KEY):
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -772,8 +845,13 @@ async def main():
 
     load_hubert_model()
     load_fcpe_model()
-    for voice in TARGET_VOICES:
-        model, tgt_sr = load_net_g_model(pth_path=TARGET_VOICES[voice].model_pth_path)
+    for voice, voice_props in TARGET_VOICES.items():
+        if MODE == Mode.PYTORCH:
+            model, tgt_sr = load_net_g_model(pth_path=voice_props.model_pth_path)
+        elif MODE == Mode.ONNX:
+            model, tgt_sr = load_onnx_net_g_model(onnx_path=voice_props.model_onnx_path)
+        else:
+            raise RuntimeError(f'Invalid mode: {MODE}')
         net_g_models[voice] = model
         net_g_models_tgt_sr[voice] = tgt_sr
 
