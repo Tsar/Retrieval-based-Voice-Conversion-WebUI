@@ -29,7 +29,11 @@ from torchfcpe.models_infer import InferCFNaiveMelPE
 
 from infer.lib.jit.get_synthesizer import get_synthesizer
 
-import onnxruntime  # required only for ONNX mode
+# Following modules are used only in ONNX mode
+from torchfcpe.models_infer import spawn_wav2mel
+from torchfcpe.tools import DotDict
+from torchfcpe.mel_extractor import Wav2MelModule
+import onnxruntime
 
 logger = logging.getLogger('infer-batch-websocket-server')
 
@@ -243,7 +247,7 @@ result_resamplers = {}
 result_resamplers_lock = Lock()
 
 hubert_model: Optional[HubertModel] = None
-fcpe_model: Optional[InferCFNaiveMelPE] = None
+fcpe_model: Optional[InferCFNaiveMelPE | onnxruntime.InferenceSession] = None
 net_g_models: dict[str, nn.Module | onnxruntime.InferenceSession] = {}
 net_g_models_tgt_sr: dict[str, int] = {}
 
@@ -272,6 +276,13 @@ def load_fcpe_model():
     fcpe_model = spawn_bundled_infer_model(device=GPU)
     load_done_time = time.perf_counter()
     logger.info(f'Loaded fcpe model in {(load_done_time - load_start_time) * 1000:.1f} ms')
+
+def load_onnx_fcpe_model():
+    global fcpe_model
+    load_start_time = time.perf_counter()
+    fcpe_model = onnxruntime.InferenceSession(f'export_onnx_new/fcpe.onnx', providers=['CUDAExecutionProvider'])
+    load_done_time = time.perf_counter()
+    logger.info(f'Loaded ONNX fcpe model in {(load_done_time - load_start_time) * 1000:.1f} ms')
 
 def load_net_g_model(pth_path: str) -> tuple[nn.Module, int]:
     load_start_time = time.perf_counter()
@@ -355,6 +366,12 @@ async def hubert_inference_worker():
             # TODO: Fail tasks which were taken from the queue
 
 async def fcpe_inference_worker():
+    mel_extractor: Optional[Wav2MelModule] = None
+    if MODE == Mode.ONNX:
+        mel_extractor_args = DotDict()
+        mel_extractor_args.mel = DotDict({'fmax': 8000, 'fmin': 0, 'hop_size': 160, 'n_fft': 1024, 'num_mels': 128, 'sr': 16000, 'win_size': 1024})
+        mel_extractor = spawn_wav2mel(mel_extractor_args, 'cpu')
+        logger.info('Loaded mel extractor')
     while True:
         try:
             t0 = time.perf_counter()
@@ -371,19 +388,40 @@ async def fcpe_inference_worker():
             t1 = time.perf_counter()
             input_wav_batch = torch.stack([task.input_wav for task in tasks_batch], dim=0)
 
+            mel: Optional[np.ndarray] = None
+            if MODE == Mode.ONNX:
+                mel = mel_extractor(input_wav_batch.cpu(), sample_rate=16000).numpy(force=True)
+
             t2 = time.perf_counter()
             loop = asyncio.get_running_loop()
-            def perform_inference():
-                return fcpe_model.infer(
-                    input_wav_batch.to(GPU).float(),
-                    sr=16000,
-                    decoder_mode="local_argmax",
-                    threshold=0.006,
-                )
-            f0_batch = await loop.run_in_executor(fcpe_executor, perform_inference)
-            assert f0_batch.size(0) == B
+            if MODE == Mode.PYTORCH:
+                assert isinstance(fcpe_model, InferCFNaiveMelPE)
+                def perform_inference():
+                    return fcpe_model.infer(
+                        input_wav_batch.to(GPU).float(),
+                        sr=16000,
+                        decoder_mode="local_argmax",
+                        threshold=0.006,
+                    )
+                f0_batch = await loop.run_in_executor(fcpe_executor, perform_inference)
+            elif MODE == Mode.ONNX:
+                assert isinstance(fcpe_model, onnxruntime.InferenceSession)
+                def perform_onnx_inference():
+                    outputs = fcpe_model.run(
+                        output_names=None,
+                        input_feed={'mel': mel},
+                    )
+                    assert len(outputs) == 1  # pitchf
+                    return outputs[0]
+                f0_batch = await loop.run_in_executor(fcpe_executor, perform_onnx_inference)
+            else:
+                raise RuntimeError(f'Invalid mode: {MODE}')
 
             t3 = time.perf_counter()
+            if MODE == Mode.ONNX:
+                f0_batch = torch.from_numpy(f0_batch).to(GPU)
+
+            assert f0_batch.size(0) == B
             for task, f0 in zip(tasks_batch, f0_batch):
                 task.future.set_result(f0)
             t4 = time.perf_counter()
@@ -844,7 +882,12 @@ async def main():
             return
 
     load_hubert_model()
-    load_fcpe_model()
+    if MODE == Mode.PYTORCH:
+        load_fcpe_model()
+    elif MODE == Mode.ONNX:
+        load_onnx_fcpe_model()
+    else:
+        raise RuntimeError(f'Invalid mode: {MODE}')
     for voice, voice_props in TARGET_VOICES.items():
         if MODE == Mode.PYTORCH:
             model, tgt_sr = load_net_g_model(pth_path=voice_props.model_pth_path)
