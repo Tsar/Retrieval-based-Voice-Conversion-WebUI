@@ -29,7 +29,7 @@ from torchfcpe.models_infer import InferCFNaiveMelPE
 
 from infer.lib.jit.get_synthesizer import get_synthesizer
 
-# Following modules are used only in ONNX mode
+# Following modules are used only in ONNX or COMPARE modes
 from torchfcpe.models_infer import spawn_wav2mel
 from torchfcpe.tools import DotDict
 from torchfcpe.mel_extractor import Wav2MelModule
@@ -255,6 +255,7 @@ fcpe_model: Optional[InferCFNaiveMelPE] = None
 net_g_models: dict[str, nn.Module] = {}
 net_g_models_tgt_sr: dict[str, int] = {}
 
+hubert_onnx_session: Optional[onnxruntime.InferenceSession] = None
 fcpe_onnx_session: Optional[onnxruntime.InferenceSession] = None
 fcpe_mel_extractor: Optional[Wav2MelModule] = None
 net_g_onnx_sessions: dict[str, onnxruntime.InferenceSession] = {}
@@ -277,6 +278,13 @@ def load_hubert_model():
 
     load_done_time = time.perf_counter()
     logger.info(f'Loaded Hubert model in {(load_done_time - load_start_time) * 1000:.1f} ms')
+
+def load_hubert_onnx_model():
+    global hubert_onnx_session
+    load_start_time = time.perf_counter()
+    hubert_onnx_session = onnxruntime.InferenceSession(f'export_onnx_new/hubert_extract_features.onnx', providers=['CUDAExecutionProvider'])
+    load_done_time = time.perf_counter()
+    logger.info(f'Loaded ONNX Hubert model in {(load_done_time - load_start_time) * 1000:.1f} ms')
 
 def load_fcpe_model():
     global fcpe_model
@@ -357,19 +365,41 @@ async def hubert_inference_worker():
                 input_wav_batch = input_wav_batch.float()
             padding_mask = torch.BoolTensor(input_wav_batch.shape).to(GPU).fill_(False)
 
+            if infer_onnx:
+                input_wav_batch_np = input_wav_batch.numpy(force=True)
+
             t2 = time.perf_counter()
             loop = asyncio.get_running_loop()
-            def perform_inference():
-                with torch.no_grad():
-                    return hubert_model.extract_features(
-                        source=input_wav_batch,
-                        padding_mask=padding_mask,
-                        output_layer=12,
+            if infer_pytorch:
+                def perform_inference():
+                    with torch.no_grad():
+                        return hubert_model.extract_features(
+                            source=input_wav_batch,
+                            padding_mask=padding_mask,
+                            output_layer=12,
+                        )
+                feats_batch, _ = await loop.run_in_executor(hubert_executor, perform_inference)
+            if infer_onnx:
+                def perform_onnx_inference():
+                    outputs = hubert_onnx_session.run(
+                        output_names=None,
+                        input_feed={'input_wav': input_wav_batch_np},
                     )
-            feats_batch, _ = await loop.run_in_executor(hubert_executor, perform_inference)
-            assert feats_batch.size(0) == B
+                    assert len(outputs) == 1  # features
+                    return outputs[0]
+                feats_batch_onnx = await loop.run_in_executor(hubert_executor, perform_onnx_inference)
 
             t3 = time.perf_counter()
+            if infer_onnx:
+                feats_batch_onnx = torch.from_numpy(feats_batch_onnx).to(GPU)
+                if mode == Mode.COMPARE:
+                    if feats_batch.shape != feats_batch_onnx.shape:
+                        logger.warning(f'FOUND DIFFERENCES FOR HUBERT: Shapes differ: {feats_batch.shape} != {feats_batch_onnx.shape}')
+                    elif not torch.allclose(feats_batch, feats_batch_onnx):
+                        logger.warning(f'FOUND DIFFERENCES FOR HUBERT: Values differ')
+                feats_batch = feats_batch_onnx
+
+            assert feats_batch.size(0) == B
             for task, feats in zip(tasks_batch, feats_batch):
                 task.future.set_result(feats)
             t4 = time.perf_counter()
@@ -899,14 +929,15 @@ async def main():
             logger.warning('SSL certificates NOT FOUND, unencrypted serving prohibited')
             return
 
-    load_hubert_model()
     if infer_pytorch:
+        load_hubert_model()
         load_fcpe_model()
         for voice, voice_props in TARGET_VOICES.items():
             model, tgt_sr = load_net_g_model(pth_path=voice_props.model_pth_path)
             net_g_models[voice] = model
             net_g_models_tgt_sr[voice] = tgt_sr
     if infer_onnx:
+        load_hubert_onnx_model()
         load_fcpe_onnx_model()
         load_fcpe_mel_extractor()
         for voice, voice_props in TARGET_VOICES.items():
