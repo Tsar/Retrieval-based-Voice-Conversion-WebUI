@@ -419,7 +419,8 @@ async def fcpe_inference_worker():
 
             t3 = time.perf_counter()
             if MODE == Mode.ONNX:
-                f0_batch = torch.from_numpy(f0_batch).to(GPU)
+                # For some reason ONNX sometimes gives NaNs instead of zeros, we have to use nan_to_num
+                f0_batch = torch.nan_to_num(torch.from_numpy(f0_batch), nan=0.0).to(GPU)
 
             assert f0_batch.size(0) == B
             for task, f0 in zip(tasks_batch, f0_batch):
