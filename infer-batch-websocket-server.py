@@ -585,10 +585,6 @@ async def net_g_inference_worker(
             logger.error(f'net_g inference cycle step failed: {ex}')
             # TODO: Fail tasks which were taken from the queue
 
-total_preprocessing_duration = 0.0
-total_preprocessing_count = 0
-total_preprocessing_lock = Lock()
-
 # Should be executed sequentially for each context, can be executed in parallel for different contexts
 def prepare_hubert_and_fcpe_tasks(
     settings: SessionSettings,
@@ -618,15 +614,7 @@ def prepare_hubert_and_fcpe_tasks(
     )
     t1 = time.perf_counter()
     print(f'prepare_hubert_and_fcpe_tasks done in {(t1 - t0) * 1000:.1f} ms')
-    with total_preprocessing_lock:
-        global total_preprocessing_duration, total_preprocessing_count
-        total_preprocessing_duration += (t1 - t0) * 1000
-        total_preprocessing_count += 1
     return hubert_task, fcpe_task
-
-total_prepare_net_g_task_duration = 0.0
-total_prepare_net_g_task_count = 0
-total_prepare_net_g_task_lock = Lock()
 
 # Should be executed sequentially for each context, can be executed in parallel for different contexts
 def prepare_net_g_task(
@@ -662,10 +650,6 @@ def prepare_net_g_task(
     )
     t1 = time.perf_counter()
     print(f'prepare_net_g_task done in {(t1 - t0) * 1000:.1f} ms')
-    with total_prepare_net_g_task_lock:
-        global total_prepare_net_g_task_duration, total_prepare_net_g_task_count
-        total_prepare_net_g_task_duration += (t1 - t0) * 1000
-        total_prepare_net_g_task_count += 1
     return net_g_task
 
 def phase_vocoder(a, b, fade_out, fade_in):
@@ -690,11 +674,6 @@ def phase_vocoder(a, b, fade_out, fade_in):
         + torch.sum(absab * torch.cos(w * t + phia), -1) * window / n
     )
     return result
-
-total_postprocessing_duration = 0.0
-total_sola_duration = 0.0
-total_postprocessing_count = 0
-total_postprocessing_lock = Lock()
 
 # Should be executed sequentially for each context, can be executed in parallel for different contexts
 def postprocess_inference_result(
@@ -741,11 +720,6 @@ def postprocess_inference_result(
         f'postprocessing: {(t3 - t0) * 1000:.1f} ms [resample: {(t1 - t0) * 1000:.1f} ms, '
         f'SOLA: {(t2 - t1) * 1000:.1f} ms, f32->i16: {(t3 - t2) * 1000:.1f} ms]'
     )
-    with total_postprocessing_lock:
-        global total_postprocessing_duration, total_sola_duration, total_postprocessing_count
-        total_postprocessing_duration += (t3 - t0) * 1000
-        total_sola_duration += (t2 - t1) * 1000
-        total_postprocessing_count += 1
     return processed_i16
 
 def error_message(message, log_prefix='', details_to_log=None):
@@ -864,12 +838,6 @@ async def handler(websocket):
                 except Exception as exc:
                     logger.error(f'Preprocessing loop cycle step failed: {exc}')
             logger.info(f'{log_prefix}Preprocessing loop stopped gracefully')
-            with total_preprocessing_lock:
-                print(
-                    f'== Preprocessing loop stats ==\n'
-                    f'  * Total preprocessing count : {total_preprocessing_count}\n'
-                    f'  * Avg preprocessing duration: {total_preprocessing_duration / total_preprocessing_count:.1f} ms'
-                )
 
         async def intermediate_loop():
             context = IntermediateContext()
@@ -900,12 +868,6 @@ async def handler(websocket):
                 except Exception as exc:
                     logger.error(f'Intermediate loop cycle step failed: {exc}')
             logger.info(f'{log_prefix}Intermediate loop stopped gracefully')
-            with total_prepare_net_g_task_lock:
-                print(
-                    f'== Intermediate loop stats ==\n'
-                    f'  * Total prepare_net_g_task count : {total_prepare_net_g_task_count}\n'
-                    f'  * Avg prepare_net_g_task duration: {total_prepare_net_g_task_duration / total_prepare_net_g_task_count:.1f} ms'
-                )
 
         async def postprocessing_loop():
             context = PostprocessContext()
@@ -930,13 +892,6 @@ async def handler(websocket):
                 except Exception as exc:
                     logger.error(f'Postprocessing loop cycle step failed: {exc}')
             logger.info(f'{log_prefix}Postprocessing loop stopped gracefully')
-            with total_postprocessing_lock:
-                print(
-                    f'== Postprocessing loop stats ==\n'
-                    f'  * Total postprocessing count : {total_postprocessing_count}\n'
-                    f'  * Avg postprocessing duration: {total_postprocessing_duration / total_postprocessing_count:.1f} ms\n'
-                    f'  * Avg SOLA duration          : {total_sola_duration / total_postprocessing_count:.1f} ms'
-                )
 
         asyncio.create_task(preprocessing_loop())
         asyncio.create_task(intermediate_loop())
