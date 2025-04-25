@@ -24,7 +24,7 @@ if __name__ == '__main__':
             None,
             {
                 'input_wav': C_input_wav_batch.numpy(force=True),
-                'padding_mask': C_padding_mask.numpy(force=True),
+                #'padding_mask': C_padding_mask.numpy(force=True),
             }
         )
         end_ts = time.perf_counter()

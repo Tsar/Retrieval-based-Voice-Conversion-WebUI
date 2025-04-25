@@ -39,21 +39,23 @@ assert C_input_wav_batch.shape == torch.Size([10, 35840])
 C_padding_mask = torch.BoolTensor(C_input_wav_batch.shape).to(GPU).fill_(False)
 assert C_padding_mask.shape == torch.Size([10, 35840])
 
+# Leaving some useful links here:
+#  https://github.com/facebookresearch/fairseq/issues/5595 - used "m = float(m)" hack from here
+#  https://github.com/facebookresearch/fairseq/issues/5596 - got rid of padding_mask because of this hack
+
 class HubertExtractFeaturesWrapper(nn.Module):
     def __init__(self, orig_hubert_model: HubertModel):
         super().__init__()
         self.model = orig_hubert_model
 
-    def forward(self, source, padding_mask) -> torch.Tensor:  # only pass Tensors here
-        return self.model.extract_features(
+    def forward(self, source) -> torch.Tensor:  # only pass Tensors here
+        return self.model(
             source=source,
-            padding_mask=padding_mask,
+            #padding_mask=padding_mask,
+            mask=False,
+            features_only=True,
             output_layer=12,
-        )[0]
-
-# Leaving some useful links here:
-#  https://github.com/facebookresearch/fairseq/issues/5595 - used "m = float(m)" hack from here
-#  https://github.com/facebookresearch/fairseq/issues/5596 - this hack not yet used
+        )['x'][0]
 
 def export_to_onnx(use_scripting=False, use_dynamic_axes=True):
     model = HubertExtractFeaturesWrapper(orig_hubert_model=hubert_model)
@@ -68,14 +70,17 @@ def export_to_onnx(use_scripting=False, use_dynamic_axes=True):
         to_export,
         (
             C_input_wav_batch,  # source
-            C_padding_mask,     # padding_mask
+            #C_padding_mask,     # padding_mask
         ),
         'hubert_extract_features.onnx',
-        input_names=['input_wav', 'padding_mask'],
+        input_names=[
+            'input_wav',
+            #'padding_mask',
+        ],
         output_names=['features'],
         dynamic_axes={
             'input_wav': {0: 'batch_size', 1: 'audio_len'},
-            'padding_mask': {0: 'batch_size', 1: 'audio_len'},
+            #'padding_mask': {0: 'batch_size', 1: 'audio_len'},
             'features': {0: 'batch_size', 1: 'sequence_len'},
         } if use_dynamic_axes else None,
         opset_version=17,
