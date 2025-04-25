@@ -128,11 +128,11 @@ RESAMPLER_TO_16K = tat.Resample(
     orig_freq=SAMPLE_RATE,
     new_freq=16000,
     dtype=torch.float32,
-).to(GPU)
+)
 
 FADE_IN_WINDOW: torch.Tensor = (
     torch.sin(
-        0.5 * np.pi * torch.linspace(0.0, 1.0, steps=SOLA_BUFFER_FRAME, device=GPU, dtype=torch.float32)
+        0.5 * np.pi * torch.linspace(0.0, 1.0, steps=SOLA_BUFFER_FRAME, dtype=torch.float32)
     ) ** 2
 )
 FADE_OUT_WINDOW: torch.Tensor = 1 - FADE_IN_WINDOW
@@ -148,8 +148,8 @@ class SessionSettings:
 
 class PreprocessContext:
     def __init__(self):
-        self.input_wav: torch.Tensor = torch.zeros(INPUT_WAV_LEN, device=GPU, dtype=torch.float32)
-        self.input_wav_res: torch.Tensor = torch.zeros(INPUT_WAV_RES_LEN, device=GPU, dtype=torch.float32)
+        self.input_wav: torch.Tensor = torch.zeros(INPUT_WAV_LEN, dtype=torch.float32)
+        self.input_wav_res: torch.Tensor = torch.zeros(INPUT_WAV_RES_LEN, dtype=torch.float32)
 
     # TODO: Fill with zeros again on message end?
 
@@ -157,14 +157,14 @@ class PreprocessContext:
         block_f32 = np.frombuffer(block_i16, dtype=np.int16).astype(np.float32) / 32768.0
         assert block_f32.shape[0] == BLOCK_FRAME
         self.input_wav[:-BLOCK_FRAME] = self.input_wav[BLOCK_FRAME:].clone()
-        self.input_wav[-BLOCK_FRAME:] = torch.from_numpy(block_f32).to(GPU)
+        self.input_wav[-BLOCK_FRAME:] = torch.from_numpy(block_f32)
         self.input_wav_res[:-BLOCK_FRAME_16K] = self.input_wav_res[BLOCK_FRAME_16K:].clone()
         self.input_wav_res[-BLOCK_FRAME_16K - 160:] = RESAMPLER_TO_16K(self.input_wav[-BLOCK_FRAME - 2 * ZC:])[160:]
 
 class IntermediateContext:
     def __init__(self):
-        self.cache_pitch = torch.zeros(1024, device=GPU, dtype=torch.long)
-        self.cache_pitchf = torch.zeros(1024, device=GPU, dtype=torch.float32)
+        self.cache_pitch = torch.zeros(1024, dtype=torch.long)
+        self.cache_pitchf = torch.zeros(1024, dtype=torch.float32)
 
     def update_pitch_caches(self, pitch: torch.Tensor, pitchf: torch.Tensor):
         self.cache_pitch[:-PITCH_SHIFT] = self.cache_pitch[PITCH_SHIFT:].clone()
@@ -174,7 +174,7 @@ class IntermediateContext:
 
 class PostprocessContext:
     def __init__(self):
-        self.sola_buffer: torch.Tensor = torch.zeros(SOLA_BUFFER_FRAME, device=GPU, dtype=torch.float32)
+        self.sola_buffer: torch.Tensor = torch.zeros(SOLA_BUFFER_FRAME, dtype=torch.float32)
 
 class Task:
     def __init__(self, priority: int, sequence: int, is_last_for_message: bool, future: asyncio.Future):
@@ -335,7 +335,7 @@ def load_net_g_onnx_model(onnx_path: str) -> tuple[onnxruntime.InferenceSession,
 
 def create_pitch_and_pitchf(f0: torch.Tensor, f0_up_key: float):
     f0 *= pow(2, f0_up_key / 12)
-    f0 = f0.float().to(GPU).squeeze()
+    f0 = f0.float().squeeze()
     f0_mel = 1127 * torch.log(1 + f0 / 700)
     f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - F0_MEL_MIN) * 254 / (F0_MEL_MAX - F0_MEL_MIN) + 1
     f0_mel[f0_mel <= 1] = 1
@@ -363,10 +363,12 @@ async def hubert_inference_worker():
                 input_wav_batch = input_wav_batch.half()
             else:
                 input_wav_batch = input_wav_batch.float()
-            padding_mask = torch.BoolTensor(input_wav_batch.shape).to(GPU).fill_(False)
 
             if infer_onnx:
                 input_wav_batch_np = input_wav_batch.numpy(force=True)
+            if infer_pytorch:
+                input_wav_batch = input_wav_batch.to(GPU)
+                padding_mask = torch.BoolTensor(input_wav_batch.shape).to(GPU).fill_(False)
 
             t2 = time.perf_counter()
             loop = asyncio.get_running_loop()
@@ -391,7 +393,7 @@ async def hubert_inference_worker():
 
             t3 = time.perf_counter()
             if infer_onnx:
-                feats_batch_onnx = torch.from_numpy(feats_batch_onnx).to(GPU)
+                feats_batch_onnx = torch.from_numpy(feats_batch_onnx)
                 if mode == Mode.COMPARE:
                     if feats_batch.shape != feats_batch_onnx.shape:
                         logger.warning(f'FOUND DIFFERENCES FOR HUBERT: Shapes differ: {feats_batch.shape} != {feats_batch_onnx.shape}')
@@ -400,6 +402,7 @@ async def hubert_inference_worker():
                 feats_batch = feats_batch_onnx
 
             assert feats_batch.size(0) == B
+            feats_batch = feats_batch.cpu()
             for task, feats in zip(tasks_batch, feats_batch):
                 task.future.set_result(feats)
             t4 = time.perf_counter()
@@ -430,13 +433,15 @@ async def fcpe_inference_worker():
             input_wav_batch = torch.stack([task.input_wav for task in tasks_batch], dim=0)
             if infer_onnx:
                 mel = fcpe_mel_extractor(input_wav_batch.cpu(), sample_rate=16000).numpy(force=True)
+            if infer_pytorch:
+                input_wav_batch = input_wav_batch.to(GPU).float()
 
             t2 = time.perf_counter()
             loop = asyncio.get_running_loop()
             if infer_pytorch:
                 def perform_inference():
                     return fcpe_model.infer(
-                        input_wav_batch.to(GPU).float(),
+                        input_wav_batch,
                         sr=16000,
                         decoder_mode="local_argmax",
                         threshold=0.006,
@@ -455,7 +460,7 @@ async def fcpe_inference_worker():
             t3 = time.perf_counter()
             if infer_onnx:
                 # For some reason ONNX sometimes gives NaNs instead of zeros, we have to use nan_to_num
-                f0_batch_onnx = torch.nan_to_num(torch.from_numpy(f0_batch_onnx), nan=0.0).to(GPU)
+                f0_batch_onnx = torch.nan_to_num(torch.from_numpy(f0_batch_onnx), nan=0.0)
                 if mode == Mode.COMPARE:
                     if f0_batch.shape != f0_batch_onnx.shape:
                         logger.warning(f'FOUND DIFFERENCES FOR FCPE: Shapes differ: {f0_batch.shape} != {f0_batch_onnx.shape}')
@@ -464,6 +469,7 @@ async def fcpe_inference_worker():
                 f0_batch = f0_batch_onnx
 
             assert f0_batch.size(0) == B
+            f0_batch = f0_batch.cpu()
             for task, f0 in zip(tasks_batch, f0_batch):
                 task.future.set_result(f0)
             t4 = time.perf_counter()
@@ -518,6 +524,11 @@ async def net_g_inference_worker(
                 cache_pitchf_np = cache_pitchf.numpy(force=True)
                 sid_np = sid.numpy(force=True)
 
+            if infer_pytorch:
+                feats = feats.to(GPU)
+                cache_pitch = cache_pitch.to(GPU)
+                cache_pitchf = cache_pitchf.to(GPU)
+
             t2 = time.perf_counter()
             loop = asyncio.get_running_loop()
             if infer_pytorch:
@@ -552,7 +563,7 @@ async def net_g_inference_worker(
 
             t3 = time.perf_counter()
             if infer_onnx:
-                infered_audio_batch_onnx = torch.from_numpy(infered_audio_batch_onnx).to(GPU)
+                infered_audio_batch_onnx = torch.from_numpy(infered_audio_batch_onnx)
                 if mode == Mode.COMPARE:
                     if infered_audio_batch.shape != infered_audio_batch_onnx.shape:
                         logger.warning(f'FOUND DIFFERENCES FOR NET_G: Shapes differ: {infered_audio_batch.shape} != {infered_audio_batch_onnx.shape}')
@@ -561,6 +572,7 @@ async def net_g_inference_worker(
                 infered_audio_batch = infered_audio_batch_onnx
 
             assert infered_audio_batch.size(0) == B
+            infered_audio_batch = infered_audio_batch.cpu()
             for task, infered_audio in zip(tasks_batch, infered_audio_batch):
                 task.future.set_result(infered_audio.float())
             t4 = time.perf_counter()
@@ -572,6 +584,10 @@ async def net_g_inference_worker(
         except Exception as ex:
             logger.error(f'net_g inference cycle step failed: {ex}')
             # TODO: Fail tasks which were taken from the queue
+
+total_preprocessing_duration = 0.0
+total_preprocessing_count = 0
+total_preprocessing_lock = Lock()
 
 # Should be executed sequentially for each context, can be executed in parallel for different contexts
 def prepare_hubert_and_fcpe_tasks(
@@ -602,7 +618,15 @@ def prepare_hubert_and_fcpe_tasks(
     )
     t1 = time.perf_counter()
     print(f'prepare_hubert_and_fcpe_tasks done in {(t1 - t0) * 1000:.1f} ms')
+    with total_preprocessing_lock:
+        global total_preprocessing_duration, total_preprocessing_count
+        total_preprocessing_duration += (t1 - t0) * 1000
+        total_preprocessing_count += 1
     return hubert_task, fcpe_task
+
+total_prepare_net_g_task_duration = 0.0
+total_prepare_net_g_task_count = 0
+total_prepare_net_g_task_lock = Lock()
 
 # Should be executed sequentially for each context, can be executed in parallel for different contexts
 def prepare_net_g_task(
@@ -638,6 +662,10 @@ def prepare_net_g_task(
     )
     t1 = time.perf_counter()
     print(f'prepare_net_g_task done in {(t1 - t0) * 1000:.1f} ms')
+    with total_prepare_net_g_task_lock:
+        global total_prepare_net_g_task_duration, total_prepare_net_g_task_count
+        total_prepare_net_g_task_duration += (t1 - t0) * 1000
+        total_prepare_net_g_task_count += 1
     return net_g_task
 
 def phase_vocoder(a, b, fade_out, fade_in):
@@ -663,6 +691,11 @@ def phase_vocoder(a, b, fade_out, fade_in):
     )
     return result
 
+total_postprocessing_duration = 0.0
+total_sola_duration = 0.0
+total_postprocessing_count = 0
+total_postprocessing_lock = Lock()
+
 # Should be executed sequentially for each context, can be executed in parallel for different contexts
 def postprocess_inference_result(
     settings: SessionSettings,
@@ -680,7 +713,7 @@ def postprocess_inference_result(
                     orig_freq=upp_res * 100,
                     new_freq=SAMPLE_RATE,
                     dtype=torch.float32,
-                ).to(GPU)
+                )
             resampler = result_resamplers[upp_res]
         infered_audio = resampler(infered_audio[:, :RETURN_LENGTH * upp_res])  # TODO: Move to batch processing?
     infer_wav = infered_audio.squeeze()
@@ -689,7 +722,7 @@ def postprocess_inference_result(
     t1 = time.perf_counter()
     conv_input = infer_wav[None, None, :SOLA_BUFFER_FRAME + SOLA_SEARCH_FRAME]
     cor_nom = F.conv1d(conv_input, context.sola_buffer[None, None, :])
-    cor_den = torch.sqrt(F.conv1d(conv_input**2, torch.ones(1, 1, SOLA_BUFFER_FRAME, device=GPU)) + 1e-8)
+    cor_den = torch.sqrt(F.conv1d(conv_input**2, torch.ones(1, 1, SOLA_BUFFER_FRAME)) + 1e-8)
     sola_offset = torch.argmax(cor_nom[0, 0] / cor_den[0, 0])
     infer_wav = infer_wav[sola_offset:]
     infer_wav[:SOLA_BUFFER_FRAME] = phase_vocoder(
@@ -701,13 +734,18 @@ def postprocess_inference_result(
     context.sola_buffer[:] = infer_wav[BLOCK_FRAME:BLOCK_FRAME + SOLA_BUFFER_FRAME]
 
     t2 = time.perf_counter()
-    processed_f32 = infer_wav[:BLOCK_FRAME].t().cpu().numpy()
+    processed_f32 = infer_wav[:BLOCK_FRAME].t().numpy()
     processed_i16 = (np.clip(processed_f32, -1.0, 1.0 - 1.0 / 32768.0) * 32768.0).astype(np.int16).tobytes()
     t3 = time.perf_counter()
     print(
         f'postprocessing: {(t3 - t0) * 1000:.1f} ms [resample: {(t1 - t0) * 1000:.1f} ms, '
         f'SOLA: {(t2 - t1) * 1000:.1f} ms, f32->i16: {(t3 - t2) * 1000:.1f} ms]'
     )
+    with total_postprocessing_lock:
+        global total_postprocessing_duration, total_sola_duration, total_postprocessing_count
+        total_postprocessing_duration += (t3 - t0) * 1000
+        total_sola_duration += (t2 - t1) * 1000
+        total_postprocessing_count += 1
     return processed_i16
 
 def error_message(message, log_prefix='', details_to_log=None):
@@ -826,6 +864,12 @@ async def handler(websocket):
                 except Exception as exc:
                     logger.error(f'Preprocessing loop cycle step failed: {exc}')
             logger.info(f'{log_prefix}Preprocessing loop stopped gracefully')
+            with total_preprocessing_lock:
+                print(
+                    f'== Preprocessing loop stats ==\n'
+                    f'  * Total preprocessing count : {total_preprocessing_count}\n'
+                    f'  * Avg preprocessing duration: {total_preprocessing_duration / total_preprocessing_count:.1f} ms'
+                )
 
         async def intermediate_loop():
             context = IntermediateContext()
@@ -856,6 +900,12 @@ async def handler(websocket):
                 except Exception as exc:
                     logger.error(f'Intermediate loop cycle step failed: {exc}')
             logger.info(f'{log_prefix}Intermediate loop stopped gracefully')
+            with total_prepare_net_g_task_lock:
+                print(
+                    f'== Intermediate loop stats ==\n'
+                    f'  * Total prepare_net_g_task count : {total_prepare_net_g_task_count}\n'
+                    f'  * Avg prepare_net_g_task duration: {total_prepare_net_g_task_duration / total_prepare_net_g_task_count:.1f} ms'
+                )
 
         async def postprocessing_loop():
             context = PostprocessContext()
@@ -880,6 +930,13 @@ async def handler(websocket):
                 except Exception as exc:
                     logger.error(f'Postprocessing loop cycle step failed: {exc}')
             logger.info(f'{log_prefix}Postprocessing loop stopped gracefully')
+            with total_postprocessing_lock:
+                print(
+                    f'== Postprocessing loop stats ==\n'
+                    f'  * Total postprocessing count : {total_postprocessing_count}\n'
+                    f'  * Avg postprocessing duration: {total_postprocessing_duration / total_postprocessing_count:.1f} ms\n'
+                    f'  * Avg SOLA duration          : {total_sola_duration / total_postprocessing_count:.1f} ms'
+                )
 
         asyncio.create_task(preprocessing_loop())
         asyncio.create_task(intermediate_loop())
