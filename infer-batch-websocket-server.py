@@ -50,8 +50,12 @@ ALLOW_UNENCRYPTED_SERVING = int(os.environ.get('ALLOW_UNENCRYPTED_SERVING', 0))
 class Mode(str, Enum):
     PYTORCH = 'PYTORCH'
     ONNX    = 'ONNX'
+    COMPARE = 'COMPARE'  # Load both Pytorch and ONNX versions of models and compare results
 
-MODE = os.environ.get('MODE', Mode.PYTORCH)
+mode = os.environ.get('MODE', Mode.PYTORCH)
+infer_pytorch = mode in {Mode.PYTORCH, Mode.COMPARE}
+infer_onnx = mode in {Mode.ONNX, Mode.COMPARE}
+assert infer_pytorch or infer_onnx
 
 INPUT_VOICES_PITCH = {
     'coral': 4,
@@ -247,9 +251,13 @@ result_resamplers = {}
 result_resamplers_lock = Lock()
 
 hubert_model: Optional[HubertModel] = None
-fcpe_model: Optional[InferCFNaiveMelPE | onnxruntime.InferenceSession] = None
-net_g_models: dict[str, nn.Module | onnxruntime.InferenceSession] = {}
+fcpe_model: Optional[InferCFNaiveMelPE] = None
+net_g_models: dict[str, nn.Module] = {}
 net_g_models_tgt_sr: dict[str, int] = {}
+
+fcpe_onnx_session: Optional[onnxruntime.InferenceSession] = None
+fcpe_mel_extractor: Optional[Wav2MelModule] = None
+net_g_onnx_sessions: dict[str, onnxruntime.InferenceSession] = {}
 
 def load_hubert_model():
     global hubert_model
@@ -277,12 +285,21 @@ def load_fcpe_model():
     load_done_time = time.perf_counter()
     logger.info(f'Loaded fcpe model in {(load_done_time - load_start_time) * 1000:.1f} ms')
 
-def load_onnx_fcpe_model():
-    global fcpe_model
+def load_fcpe_onnx_model():
+    global fcpe_onnx_session
     load_start_time = time.perf_counter()
-    fcpe_model = onnxruntime.InferenceSession(f'export_onnx_new/fcpe.onnx', providers=['CUDAExecutionProvider'])
+    fcpe_onnx_session = onnxruntime.InferenceSession(f'export_onnx_new/fcpe.onnx', providers=['CUDAExecutionProvider'])
     load_done_time = time.perf_counter()
     logger.info(f'Loaded ONNX fcpe model in {(load_done_time - load_start_time) * 1000:.1f} ms')
+
+def load_fcpe_mel_extractor():
+    global fcpe_mel_extractor
+    load_start_time = time.perf_counter()
+    args = DotDict()
+    args.mel = DotDict({'fmax': 8000, 'fmin': 0, 'hop_size': 160, 'n_fft': 1024, 'num_mels': 128, 'sr': 16000, 'win_size': 1024})
+    fcpe_mel_extractor = spawn_wav2mel(args, 'cpu')
+    load_done_time = time.perf_counter()
+    logger.info(f'Loaded fcpe mel extractor in {(load_done_time - load_start_time) * 1000:.1f} ms')
 
 def load_net_g_model(pth_path: str) -> tuple[nn.Module, int]:
     load_start_time = time.perf_counter()
@@ -301,7 +318,7 @@ def load_net_g_model(pth_path: str) -> tuple[nn.Module, int]:
     logger.info(f'Loaded net_g model in {(load_done_time - load_start_time) * 1000:.1f} ms')
     return net_g_model, net_g_tgt_sr
 
-def load_onnx_net_g_model(onnx_path: str) -> tuple[onnxruntime.InferenceSession, int]:
+def load_net_g_onnx_model(onnx_path: str) -> tuple[onnxruntime.InferenceSession, int]:
     load_start_time = time.perf_counter()
     session = onnxruntime.InferenceSession(onnx_path, providers=['CUDAExecutionProvider'])
     load_done_time = time.perf_counter()
@@ -366,12 +383,6 @@ async def hubert_inference_worker():
             # TODO: Fail tasks which were taken from the queue
 
 async def fcpe_inference_worker():
-    mel_extractor: Optional[Wav2MelModule] = None
-    if MODE == Mode.ONNX:
-        mel_extractor_args = DotDict()
-        mel_extractor_args.mel = DotDict({'fmax': 8000, 'fmin': 0, 'hop_size': 160, 'n_fft': 1024, 'num_mels': 128, 'sr': 16000, 'win_size': 1024})
-        mel_extractor = spawn_wav2mel(mel_extractor_args, 'cpu')
-        logger.info('Loaded mel extractor')
     while True:
         try:
             t0 = time.perf_counter()
@@ -387,15 +398,12 @@ async def fcpe_inference_worker():
 
             t1 = time.perf_counter()
             input_wav_batch = torch.stack([task.input_wav for task in tasks_batch], dim=0)
-
-            mel: Optional[np.ndarray] = None
-            if MODE == Mode.ONNX:
-                mel = mel_extractor(input_wav_batch.cpu(), sample_rate=16000).numpy(force=True)
+            if infer_onnx:
+                mel = fcpe_mel_extractor(input_wav_batch.cpu(), sample_rate=16000).numpy(force=True)
 
             t2 = time.perf_counter()
             loop = asyncio.get_running_loop()
-            if MODE == Mode.PYTORCH:
-                assert isinstance(fcpe_model, InferCFNaiveMelPE)
+            if infer_pytorch:
                 def perform_inference():
                     return fcpe_model.infer(
                         input_wav_batch.to(GPU).float(),
@@ -404,23 +412,26 @@ async def fcpe_inference_worker():
                         threshold=0.006,
                     )
                 f0_batch = await loop.run_in_executor(fcpe_executor, perform_inference)
-            elif MODE == Mode.ONNX:
-                assert isinstance(fcpe_model, onnxruntime.InferenceSession)
+            if infer_onnx:
                 def perform_onnx_inference():
-                    outputs = fcpe_model.run(
+                    outputs = fcpe_onnx_session.run(
                         output_names=None,
                         input_feed={'mel': mel},
                     )
                     assert len(outputs) == 1  # pitchf
                     return outputs[0]
-                f0_batch = await loop.run_in_executor(fcpe_executor, perform_onnx_inference)
-            else:
-                raise RuntimeError(f'Invalid mode: {MODE}')
+                f0_batch_onnx = await loop.run_in_executor(fcpe_executor, perform_onnx_inference)
 
             t3 = time.perf_counter()
-            if MODE == Mode.ONNX:
+            if infer_onnx:
                 # For some reason ONNX sometimes gives NaNs instead of zeros, we have to use nan_to_num
-                f0_batch = torch.nan_to_num(torch.from_numpy(f0_batch), nan=0.0).to(GPU)
+                f0_batch_onnx = torch.nan_to_num(torch.from_numpy(f0_batch_onnx), nan=0.0).to(GPU)
+                if mode == Mode.COMPARE:
+                    if f0_batch.shape != f0_batch_onnx.shape:
+                        logger.warning(f'FOUND DIFFERENCES FOR FCPE: Shapes differ: {f0_batch.shape} != {f0_batch_onnx.shape}')
+                    elif not torch.allclose(f0_batch, f0_batch_onnx):
+                        logger.warning(f'FOUND DIFFERENCES FOR FCPE: Values differ')
+                f0_batch = f0_batch_onnx
 
             assert f0_batch.size(0) == B
             for task, f0 in zip(tasks_batch, f0_batch):
@@ -435,7 +446,11 @@ async def fcpe_inference_worker():
             logger.error(f'fcpe inference cycle step failed: {ex}')
             # TODO: Fail tasks which were taken from the queue
 
-async def net_g_inference_worker(net_g: nn.Module | onnxruntime.InferenceSession, tasks_queue: PriorityQueue[NetGTask]):
+async def net_g_inference_worker(
+    net_g: Optional[nn.Module],
+    net_g_onnx_session: Optional[onnxruntime.InferenceSession],
+    tasks_queue: PriorityQueue[NetGTask],
+):
     while True:
         try:
             t0 = time.perf_counter()
@@ -466,17 +481,16 @@ async def net_g_inference_worker(net_g: nn.Module | onnxruntime.InferenceSession
             return_length = torch.LongTensor([RETURN_LENGTH])
             return_length2 = torch.LongTensor([task1.return_length2])
 
-            if MODE == Mode.ONNX:
-                feats = feats.numpy(force=True)
-                p_len = p_len.numpy(force=True)
-                cache_pitch = cache_pitch.numpy(force=True)
-                cache_pitchf = cache_pitchf.numpy(force=True)
-                sid = sid.numpy(force=True)
+            if infer_onnx:
+                feats_np = feats.numpy(force=True)
+                p_len_np = p_len.numpy(force=True)
+                cache_pitch_np = cache_pitch.numpy(force=True)
+                cache_pitchf_np = cache_pitchf.numpy(force=True)
+                sid_np = sid.numpy(force=True)
 
             t2 = time.perf_counter()
             loop = asyncio.get_running_loop()
-            if MODE == Mode.PYTORCH:
-                assert isinstance(net_g, nn.Module)
+            if infer_pytorch:
                 def perform_inference():
                     with torch.no_grad():
                         return net_g.infer(
@@ -490,28 +504,31 @@ async def net_g_inference_worker(net_g: nn.Module | onnxruntime.InferenceSession
                             return_length2,
                         )
                 infered_audio_batch, _, _ = await loop.run_in_executor(net_g_executor, perform_inference)
-            elif MODE == Mode.ONNX:
-                assert isinstance(net_g, onnxruntime.InferenceSession)
+            if infer_onnx:
                 def perform_onnx_inference():
-                    outputs = net_g.run(
+                    outputs = net_g_onnx_session.run(
                         output_names=None,
                         input_feed={
-                            'feats': feats,
-                            'p_len': p_len,
-                            'pitch': cache_pitch,
-                            'pitchf': cache_pitchf,
-                            'sid': sid,
+                            'feats': feats_np,
+                            'p_len': p_len_np,
+                            'pitch': cache_pitch_np,
+                            'pitchf': cache_pitchf_np,
+                            'sid': sid_np,
                         }
                     )
                     assert len(outputs) == 1  # ONNX returns only audio
                     return outputs[0]
-                infered_audio_batch = await loop.run_in_executor(net_g_executor, perform_onnx_inference)
-            else:
-                raise RuntimeError(f'Invalid mode: {MODE}')
+                infered_audio_batch_onnx = await loop.run_in_executor(net_g_executor, perform_onnx_inference)
 
             t3 = time.perf_counter()
-            if MODE == Mode.ONNX:
-                infered_audio_batch = torch.from_numpy(infered_audio_batch).to(GPU)
+            if infer_onnx:
+                infered_audio_batch_onnx = torch.from_numpy(infered_audio_batch_onnx).to(GPU)
+                if mode == Mode.COMPARE:
+                    if infered_audio_batch.shape != infered_audio_batch_onnx.shape:
+                        logger.warning(f'FOUND DIFFERENCES FOR NET_G: Shapes differ: {infered_audio_batch.shape} != {infered_audio_batch_onnx.shape}')
+                    elif not torch.allclose(infered_audio_batch, infered_audio_batch_onnx):
+                        logger.warning(f'FOUND DIFFERENCES FOR NET_G: Values differ')
+                infered_audio_batch = infered_audio_batch_onnx
 
             assert infered_audio_batch.size(0) == B
             for task, infered_audio in zip(tasks_batch, infered_audio_batch):
@@ -867,7 +884,7 @@ async def perform_warmup():
     # TODO
 
 async def main():
-    if MODE == Mode.ONNX:
+    if infer_onnx:
         onnxruntime.preload_dlls()
 
     ssl_context = None
@@ -883,27 +900,29 @@ async def main():
             return
 
     load_hubert_model()
-    if MODE == Mode.PYTORCH:
+    if infer_pytorch:
         load_fcpe_model()
-    elif MODE == Mode.ONNX:
-        load_onnx_fcpe_model()
-    else:
-        raise RuntimeError(f'Invalid mode: {MODE}')
-    for voice, voice_props in TARGET_VOICES.items():
-        if MODE == Mode.PYTORCH:
+        for voice, voice_props in TARGET_VOICES.items():
             model, tgt_sr = load_net_g_model(pth_path=voice_props.model_pth_path)
-        elif MODE == Mode.ONNX:
-            model, tgt_sr = load_onnx_net_g_model(onnx_path=voice_props.model_onnx_path)
-        else:
-            raise RuntimeError(f'Invalid mode: {MODE}')
-        net_g_models[voice] = model
-        net_g_models_tgt_sr[voice] = tgt_sr
+            net_g_models[voice] = model
+            net_g_models_tgt_sr[voice] = tgt_sr
+    if infer_onnx:
+        load_fcpe_onnx_model()
+        load_fcpe_mel_extractor()
+        for voice, voice_props in TARGET_VOICES.items():
+            onnx_session, tgt_sr = load_net_g_onnx_model(onnx_path=voice_props.model_onnx_path)
+            net_g_onnx_sessions[voice] = onnx_session
+            net_g_models_tgt_sr[voice] = tgt_sr
 
     asyncio.create_task(hubert_inference_worker())
     asyncio.create_task(fcpe_inference_worker())
-    for voice in net_g_models:
+    for voice in TARGET_VOICES:
         inference_queues[voice] = PriorityQueue()
-        asyncio.create_task(net_g_inference_worker(net_g_models[voice], inference_queues[voice]))
+        asyncio.create_task(net_g_inference_worker(
+            net_g=net_g_models.get(voice),
+            net_g_onnx_session=net_g_onnx_sessions.get(voice),
+            tasks_queue=inference_queues[voice],
+        ))
 
     await perform_warmup()
 
