@@ -318,6 +318,7 @@ async def fcpe_inference_worker(client_session: aiohttp.ClientSession):
             )
 
             t3 = time.perf_counter()
+            f0_batch = torch.nan_to_num(f0_batch, nan=0.0)
             assert f0_batch.size(0) == B
             for task, f0 in zip(tasks_batch, f0_batch):
                 task.future.set_result(f0)
