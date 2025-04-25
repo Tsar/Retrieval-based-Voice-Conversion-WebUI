@@ -527,7 +527,7 @@ async def net_g_inference_worker(
                     if infered_audio_batch.shape != infered_audio_batch_onnx.shape:
                         logger.warning(f'FOUND DIFFERENCES FOR NET_G: Shapes differ: {infered_audio_batch.shape} != {infered_audio_batch_onnx.shape}')
                     elif not torch.allclose(infered_audio_batch, infered_audio_batch_onnx):
-                        logger.warning(f'FOUND DIFFERENCES FOR NET_G: Values differ')
+                        logger.info(f'Found differences for net_g: Values differ, it\'s fine, cause net_g is nondeterministic model')
                 infered_audio_batch = infered_audio_batch_onnx
 
             assert infered_audio_batch.size(0) == B
