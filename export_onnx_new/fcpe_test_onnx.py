@@ -10,13 +10,8 @@ import onnxruntime
 DATA_DIR = '../load_tests/data'
 
 GPU = 'cuda:0'
-IS_HALF = True
 
-P_LEN = 224
-SKIP_HEAD = 200
-RETURN_LENGTH = 20
-
-C_input_wav_batch = torch.load('../load_tests/data/input_wav_batch_cropped.pt').cpu()
+C_input_wav_batch = torch.load(f'{DATA_DIR}/input_wav_batch_cropped.pt').cpu()
 assert C_input_wav_batch.shape == torch.Size([10, 3200])
 
 mel_extractor_args = DotDict()
@@ -28,8 +23,6 @@ C_mel = mel_extractor(C_input_wav_batch, sample_rate=16000)
 if __name__ == '__main__':
     onnxruntime.preload_dlls()
     session = onnxruntime.InferenceSession(f'fcpe.onnx', providers=['CUDAExecutionProvider'])
-    #for input_arg in session.get_inputs():
-    #    print(f'Input: {input_arg}')
     for _ in range(25):
         print(f'Running fcpe inference')
         start_ts = time.perf_counter()

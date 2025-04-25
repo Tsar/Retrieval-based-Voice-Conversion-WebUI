@@ -38,8 +38,6 @@ if __name__ == '__main__':
     onnxruntime.preload_dlls()
     for voice in VOICES:
         session = onnxruntime.InferenceSession(f'{voice}{fp32_opt_suffix}.onnx', providers=['CUDAExecutionProvider'])
-        #for input_arg in session.get_inputs():
-        #    print(f'Input: {input_arg}')
         for _ in range(5):
             print(f'Running inference for {voice}')
             start_ts = time.perf_counter()
