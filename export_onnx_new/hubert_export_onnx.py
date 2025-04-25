@@ -51,26 +51,33 @@ class HubertExtractFeaturesWrapper(nn.Module):
             output_layer=12,
         )[0]
 
-def export_to_onnx():
+# Leaving some useful links here:
+#  https://github.com/facebookresearch/fairseq/issues/5595 - used "m = float(m)" hack from here
+#  https://github.com/facebookresearch/fairseq/issues/5596 - this hack not yet used
+
+def export_to_onnx(use_scripting=False, use_dynamic_axes=True):
     model = HubertExtractFeaturesWrapper(orig_hubert_model=hubert_model)
     model.eval()
 
-    scripted_model = torch.jit.script(model)
+    to_export = model
+    if use_scripting:
+        scripted_model = torch.jit.script(model)
+        to_export = scripted_model
 
     torch.onnx.export(
-        scripted_model,
+        to_export,
         (
             C_input_wav_batch,  # source
             C_padding_mask,     # padding_mask
         ),
-        'hubert_export_features.onnx',
+        'hubert_extract_features.onnx',
         input_names=['input_wav', 'padding_mask'],
         output_names=['features'],
         dynamic_axes={
             'input_wav': {0: 'batch_size', 1: 'audio_len'},
             'padding_mask': {0: 'batch_size', 1: 'audio_len'},
             'features': {0: 'batch_size', 1: 'sequence_len'},
-        },
+        } if use_dynamic_axes else None,
         opset_version=17,
         export_params=True,
         do_constant_folding=True,
