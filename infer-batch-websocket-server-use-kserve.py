@@ -218,10 +218,6 @@ class NetGTask(Task):
 global_sequence = itertools.count()
 executor = ThreadPoolExecutor(max_workers=cpu_count() * 2)  # TODO: Replace with ProcessPoolExecutor?
 
-hubert_executor = ThreadPoolExecutor(max_workers=1)
-fcpe_executor = ThreadPoolExecutor(max_workers=1)
-net_g_executor = ThreadPoolExecutor(max_workers=1)
-
 hubert_queue: PriorityQueue[HubertTask] = PriorityQueue()
 fcpe_queue: PriorityQueue[FcpeTask] = PriorityQueue()
 inference_queues: dict[str, PriorityQueue[NetGTask]] = {}  # Each target voice has its own priority queue
