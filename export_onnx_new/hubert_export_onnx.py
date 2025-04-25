@@ -55,7 +55,7 @@ class HubertExtractFeaturesWrapper(nn.Module):
             mask=False,
             features_only=True,
             output_layer=12,
-        )['x'][0]
+        )['x']
 
 def export_to_onnx(use_scripting=False, use_dynamic_axes=True):
     model = HubertExtractFeaturesWrapper(orig_hubert_model=hubert_model)
