@@ -13,9 +13,10 @@ from torch.profiler import profile, record_function, ProfilerActivity
 
 USE_PROFILER = bool(int(os.environ.get('USE_PROFILER', 0)))
 RAND_BATCH_SIZE = bool(int(os.environ.get('RAND_BATCH_SIZE', 0)))
+MAX_BATCH_SIZE = int(os.environ.get('MAX_BATCH_SIZE', 10))  # will always use max when not random
 
 GPU = 'cuda:0'
-IS_HALF = True
+IS_HALF = bool(int(os.environ.get('HALF', 1)))
 
 hubert_model: Optional[HubertModel] = None
 
@@ -38,17 +39,18 @@ def load_hubert_model():
     load_done_time = time.perf_counter()
     print(f'Loaded Hubert model in {(load_done_time - load_start_time) * 1000:.1f} ms')
 
-C_input_wav_batch = torch.load('data/input_wav_batch.pt').to(GPU)
-assert C_input_wav_batch.shape == torch.Size([10, 35840])
+C_input_wav_batch = torch.load('data/input_wav_batch.pt').to(GPU).repeat(5, 1)
+C_input_wav_batch = C_input_wav_batch.half() if IS_HALF else C_input_wav_batch.float()
+assert C_input_wav_batch.shape == torch.Size([50, 35840])
 C_padding_mask = torch.BoolTensor(C_input_wav_batch.shape).to(GPU).fill_(False)
-assert C_padding_mask.shape == torch.Size([10, 35840])
+assert C_padding_mask.shape == torch.Size([50, 35840])
 
 def hubert_inference():
     t0 = time.perf_counter()
     if RAND_BATCH_SIZE:
-        B = random.randint(1, 10)
+        B = random.randint(1, MAX_BATCH_SIZE)
     else:
-        B = 10
+        B = MAX_BATCH_SIZE
     input_wav_batch = C_input_wav_batch[:B]
     padding_mask = C_padding_mask[:B]
 
@@ -66,9 +68,9 @@ def hubert_inference():
 def hubert_inference_with_profiler():
     t0 = time.perf_counter()
     if RAND_BATCH_SIZE:
-        B = random.randint(1, 10)
+        B = random.randint(1, MAX_BATCH_SIZE)
     else:
-        B = 10
+        B = MAX_BATCH_SIZE
     input_wav_batch = C_input_wav_batch[:B]
     padding_mask = C_padding_mask[:B]
 

@@ -17,9 +17,10 @@ from infer.lib.jit.get_synthesizer import get_synthesizer
 
 USE_PROFILER = bool(int(os.environ.get('USE_PROFILER', 0)))
 RAND_BATCH_SIZE = bool(int(os.environ.get('RAND_BATCH_SIZE', 0)))
+MAX_BATCH_SIZE = int(os.environ.get('MAX_BATCH_SIZE', 10))  # will always use max when not random
 
 GPU = 'cuda:0'
-IS_HALF = True
+IS_HALF = bool(int(os.environ.get('HALF', 1)))
 
 P_LEN = 224
 SKIP_HEAD = 200
@@ -46,11 +47,12 @@ def load_net_g_model(pth_path):
     load_done_time = time.perf_counter()
     print(f'Loaded net_g model in {(load_done_time - load_start_time) * 1000:.1f} ms')
 
-C_feats = torch.load('data/feats.pt').to(GPU)
-C_p_len = torch.full((10,), P_LEN, dtype=torch.long, device=GPU)
-C_cache_pitch = torch.load('data/cache_pitch.pt').to(GPU)
-C_cache_pitchf = torch.load('data/cache_pitchf.pt').to(GPU)
-C_sid = torch.zeros(10, dtype=torch.long, device=GPU)
+C_feats = torch.load('data/feats.pt').to(GPU).repeat(5, 1, 1)
+C_feats = C_feats.half() if IS_HALF else C_feats.float()
+C_p_len = torch.full((50,), P_LEN, dtype=torch.long, device=GPU)
+C_cache_pitch = torch.load('data/cache_pitch.pt').to(GPU).repeat(5, 1)
+C_cache_pitchf = torch.load('data/cache_pitchf.pt').to(GPU).repeat(5, 1)
+C_sid = torch.zeros(50, dtype=torch.long, device=GPU)
 
 skip_head = torch.LongTensor([SKIP_HEAD])
 return_length = torch.LongTensor([RETURN_LENGTH])
@@ -59,9 +61,9 @@ return_length2 = torch.LongTensor([RETURN_LENGTH2])
 def net_g_inference():
     t0 = time.perf_counter()
     if RAND_BATCH_SIZE:
-        B = random.randint(1, 10)
+        B = random.randint(1, MAX_BATCH_SIZE)
     else:
-        B = 10
+        B = MAX_BATCH_SIZE
     feats = C_feats[:B]
     p_len = C_p_len[:B]
     cache_pitch = C_cache_pitch[:B]
@@ -87,9 +89,9 @@ def net_g_inference():
 def net_g_inference_with_profiler():
     t0 = time.perf_counter()
     if RAND_BATCH_SIZE:
-        B = random.randint(1, 10)
+        B = random.randint(1, MAX_BATCH_SIZE)
     else:
-        B = 10
+        B = MAX_BATCH_SIZE
     feats = C_feats[:B]
     p_len = C_p_len[:B]
     cache_pitch = C_cache_pitch[:B]
