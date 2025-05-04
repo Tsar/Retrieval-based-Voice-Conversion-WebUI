@@ -29,5 +29,5 @@ ffprobe.*
 
 .idea
 /export_secrets.sh
-/websocket-test-client-data/
+/websocket-test-client-data/*.wav
 /export_onnx_new/*.onnx
