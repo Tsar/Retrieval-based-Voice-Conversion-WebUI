@@ -127,7 +127,10 @@ async def convert(
     input_voice: str = Query(
         "irina", description=f"source voice for pitch correction: {', '.join(INPUT_VOICES_PITCH)}"),
     formant_shift: float = Query(None, description="preset value if omitted"),
-    f0_method: str = Query("rmvpe"),
+    # pm по умолчанию: экстрактор F0 на praat, целиком на CPU. Нейросетевой rmvpe
+    # держит ~335 МБ VRAM, а входом здесь идёт чистый синтез TTS, не шумная запись,
+    # так что разницы на слух нет — тем более после узкой полосы рации.
+    f0_method: str = Query("pm"),
     index_rate: float = Query(0.5, ge=0.0, le=1.0),
     filter_radius: int = Query(3, ge=0, le=7),
     rms_mix_rate: float = Query(0.25, ge=0.0, le=1.0),
