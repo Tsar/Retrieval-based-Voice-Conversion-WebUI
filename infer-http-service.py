@@ -103,6 +103,40 @@ def _apply_formant_shift(audio: np.ndarray, factor: float) -> np.ndarray:
     return np.interp(dst, src, audio.astype(np.float64)).astype(audio.dtype)
 
 
+def _chunking_for_fp32(config) -> tuple:
+    """Segment sizes matching the precision we actually run at.
+
+    `Config.device_config()` picks x_pad/x_query/x_center/x_max from `is_half`, and
+    it does so **before** anything can override the precision. A card it fails to
+    recognize (Quadro P2000 matches none of its name patterns) therefore keeps the
+    fp16 "6 GB" layout — 3 s of padding per segment and no splitting below 65 s —
+    while `--fp32` doubles the memory each activation takes. On a 5 GB card that
+    combination is what a long phrase dies of: a 14.76 s reply reaches the decoder
+    as 20.76 s in one piece, peaks at 1.16 GiB, and takes the whole stack down.
+
+    These are upstream's own fp32 numbers, applied after the precision is settled.
+    """
+    return 1, 6, 38, 41
+
+
+def _free_vram() -> None:
+    """Hand the caching allocator's pool back to the driver.
+
+    After an OOM torch keeps every segment it ever reserved, so this process goes on
+    holding ~1.16 GiB instead of its usual 706 MiB — on a shared 5 GB card that is
+    enough to keep the neighbours (Whisper in the agent) failing to allocate long
+    after the phrase that caused it is gone. Observed twice on the прод machine:
+    the agent then restart-looped until the whole box was rebooted.
+    """
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:                # noqa: BLE001 — cleanup must not mask the error
+        logger.warning("empty_cache failed", exc_info=True)
+
+
 @app.get("/health")
 def health():
     return {
@@ -116,6 +150,9 @@ def health():
         "device": _state.get("device"),
         "is_half": _state.get("is_half"),
         "target_sr": _state.get("target_sr"),
+        # how input gets split: x_max is the length above which it is split at all,
+        # x_pad the padding added to every segment. Both drive peak VRAM.
+        "chunking": _state.get("chunking"),
     }
 
 
@@ -186,6 +223,7 @@ async def convert(
     if audio is None:
         # vc_single swallows exceptions and returns the traceback as text
         logger.error("conversion failed: %s", info)
+        _free_vram()      # an OOM here would otherwise poison the card for everyone
         raise HTTPException(status_code=500, detail=info)
 
     audio = _apply_formant_shift(audio, factor)
@@ -220,6 +258,14 @@ def parse_args():
     p.add_argument("--port", type=int, default=8081)
     p.add_argument("--fp32", action="store_true",
                    help="force fp32; Pascal cards are detected automatically")
+    p.add_argument("--max-segment", type=int, default=None, metavar="SECONDS",
+                   help="longest piece the decoder gets; longer input is split at its "
+                        "quietest points (fp32 default: 38). Sets x_center and x_max "
+                        "together — x_max alone would never trigger, since the split "
+                        "points themselves are placed every x_center seconds")
+    p.add_argument("--x-pad", type=int, default=None, metavar="SECONDS",
+                   help="padding added to every segment, counts twice per piece "
+                        "(fp32 default: 1)")
     return p.parse_args()
 
 
@@ -238,7 +284,25 @@ def main():
         logger.info("forcing fp32 on request")
         config.is_half = False
         config.use_fp32_config()
+        # ...and with it the segment sizes, which device_config() already chose for
+        # fp16 and does not revisit. See _chunking_for_fp32 for what that costs.
+        config.x_pad, config.x_query, config.x_center, config.x_max = _chunking_for_fp32(config)
 
+    if args.max_segment is not None:
+        # x_center is the spacing of the split points, x_max the length above which
+        # splitting happens at all. Upstream keeps them 3 s apart; do the same, or a
+        # phrase between the two would take the unsplit path anyway.
+        config.x_center = args.max_segment
+        config.x_max = args.max_segment + 3
+    if args.x_pad is not None:
+        config.x_pad = args.x_pad
+    logger.info(
+        "chunking: x_pad=%s x_query=%s x_center=%s x_max=%s (peak VRAM grows with"
+        " x_max + 2*x_pad, the longest piece the decoder ever sees)",
+        config.x_pad, config.x_query, config.x_center, config.x_max,
+    )
+
+    # Pipeline reads these in its constructor, which runs inside the first get_vc()
     vc = VC(config)
     _state.update(vc=vc, index=args.index, voice=None)
 
@@ -255,6 +319,10 @@ def main():
         device=str(config.device),
         is_half=bool(config.is_half),
         target_sr=vc.tgt_sr,
+        chunking={
+            "x_pad": config.x_pad, "x_query": config.x_query,
+            "x_center": config.x_center, "x_max": config.x_max,
+        },
     )
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
