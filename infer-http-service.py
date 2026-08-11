@@ -294,6 +294,13 @@ def main():
         # phrase between the two would take the unsplit path anyway.
         config.x_center = args.max_segment
         config.x_max = args.max_segment + 3
+        # x_query is the half-window the split point is searched in, and it has to fit
+        # before the *first* one at t=x_center. Upstream's 6 s does not once segments
+        # get short: the slice audio_sum[t - t_query : t + t_query] then starts at a
+        # negative index, wraps to the end of the array, comes back empty, and .min()
+        # raises "zero-size array to reduction operation minimum". The caller sees a
+        # bare 500 and falls back to the Piper voice — for every long phrase, silently.
+        config.x_query = max(1, min(config.x_query, args.max_segment // 2))
     if args.x_pad is not None:
         config.x_pad = args.x_pad
     logger.info(
